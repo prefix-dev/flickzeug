@@ -1,5 +1,7 @@
 # flickzeug
 
+![Flickzeug Banner](https://github.com/user-attachments/assets/f9f869e6-b3d1-46b7-86ce-1756a9fee85f)
+
 [![flickzeug on crates.io](https://img.shields.io/crates/v/flickzeug)](https://crates.io/crates/flickzeug)
 [![Documentation (latest release)](https://docs.rs/flickzeug/badge.svg)](https://docs.rs/flickzeug/)
 [![License](https://img.shields.io/badge/license-Apache-green.svg)](LICENSE-APACHE)
