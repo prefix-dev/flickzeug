@@ -222,7 +222,7 @@ impl Default for MergeOptions {
 ///
 /// ## Merging two files without conflicts
 /// ```
-/// # use diffy::merge;
+/// # use flickzeug::merge;
 /// let original = "\
 /// Devotion
 /// Dominion

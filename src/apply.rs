@@ -80,7 +80,7 @@ impl ApplyStats {
 /// # Examples
 ///
 /// ```
-/// use diffy::{apply, Diff};
+/// use flickzeug::{apply, Diff};
 ///
 /// let base = "line 1\nline 2\n";
 /// let patch_str = "--- a\n+++ b\n@@ -1,2 +1,2 @@\n line 1\n-line 2\n+line 2 modified\n";

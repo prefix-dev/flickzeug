@@ -29,7 +29,7 @@
 //! A [`Patch`] between two texts can be created by doing the following:
 //!
 //! ```
-//! use diffy::create_patch;
+//! use flickzeug::create_patch;
 //!
 //! let original = "The Way of Kings\nWords of Radiance\n";
 //! let modified = "The Way of Kings\nWords of Radiance\nOathbringer\n";
@@ -53,7 +53,7 @@
 //! color.
 //!
 //! ```
-//! # use diffy::create_patch;
+//! # use flickzeug::create_patch;
 //! #
 //! # let original = "The Way of Kings\nWords of Radiance\n";
 //! # let modified = "The Way of Kings\nWords of Radiance\nOathbringer\n";
@@ -75,7 +75,7 @@
 //! print!("{}", patch);
 //!
 //! // With color
-//! # use diffy::PatchFormatter;
+//! # use flickzeug::PatchFormatter;
 //! let f = PatchFormatter::new().with_color();
 //! print!("{}", f.fmt_patch(&patch));
 //! ```
@@ -100,7 +100,7 @@
 //! image.
 //!
 //! ```
-//! use diffy::{apply, Diff};
+//! use flickzeug::{apply, Diff};
 //!
 //! let s = "\
 //! --- a/skybreaker-ideals
@@ -164,7 +164,7 @@
 //! conflict.
 //!
 //! ```
-//! use diffy::merge;
+//! use flickzeug::merge;
 //!
 //! let original = "the final empire\nThe Well of Ascension\nThe hero of ages\n";
 //! let a = "The Final Empire\nThe Well of Ascension\nThe Hero of Ages\n";
@@ -184,7 +184,7 @@
 //! result.
 //!
 //! ```
-//! use diffy::merge;
+//! use flickzeug::merge;
 //!
 //! let original = "The Final Empire\nThe Well of Ascension\nThe hero of ages\n";
 //! let a = "The Final Empire\nThe Well of Ascension\nThe Hero of Ages\nSecret History\n";

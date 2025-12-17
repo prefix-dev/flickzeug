@@ -191,7 +191,7 @@ fn diff<'a>(original: &'a str, modified: &'a str) -> Vec<DiffLine<'a, str>> {
 /// Create a patch between two texts.
 ///
 /// ```
-/// # use diffy::create_patch;
+/// # use flickzeug::create_patch;
 /// let original = "\
 /// I am afraid, however, that all I have known - that my story - will be forgotten.
 /// I am afraid for the world that is to come.

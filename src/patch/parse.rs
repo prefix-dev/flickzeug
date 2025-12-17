@@ -101,6 +101,10 @@ pub enum HunkRangeStrategy {
 pub struct ParserConfig {
     /// Choose what to do with hunk ranges.
     pub hunk_strategy: HunkRangeStrategy,
+    /// Skip verification that hunks are in order and don't overlap.
+    /// Useful for parsing malformed patches where hunk header line numbers
+    /// are incorrect but the patch content is still valid.
+    pub skip_order_check: bool,
 }
 
 struct Parser<'a, T: Text + ?Sized> {
@@ -495,7 +499,7 @@ fn hunks<'a, T: Text + ?Sized + ToOwned>(parser: &mut Parser<'a, T>) -> Result<V
     }
 
     // check and verify that the Hunks are in sorted order and don't overlap
-    if !verify_hunks_in_order(&hunks) {
+    if !parser.config.skip_order_check && !verify_hunks_in_order(&hunks) {
         return Err(ParsePatchError::HunksOrder);
     }
 
@@ -689,7 +693,9 @@ fn hunk_lines<'a, T: Text + ?Sized + ToOwned>(
 #[cfg(test)]
 mod tests {
     use crate::patch::Line;
-    use crate::patch::parse::{HunkRangeStrategy, ParserConfig, parse_multiple_with_config};
+    use crate::patch::parse::{
+        HunkRangeStrategy, ParsePatchError, ParserConfig, parse_multiple_with_config,
+    };
 
     use super::{parse, parse_bytes, parse_multiple};
 
@@ -834,10 +840,43 @@ mod tests {
                 &input,
                 ParserConfig {
                     hunk_strategy: HunkRangeStrategy::Recount,
+                    skip_order_check: true,
                 },
             );
             insta::assert_debug_snapshot!(patches);
         });
+    }
+
+    #[test]
+    fn test_malformed_patch_strict_mode_fails() {
+        // This patch has overlapping new_range values between hunks 7 and 8
+        // (hunk 7 ends at line 876, hunk 8 starts at line 870)
+        let input =
+            std::fs::read_to_string("src/patch/test-data/0002-cross-CMakeLists.txt.patch").unwrap();
+
+        // Strict mode (default) should reject this patch
+        let result = parse_multiple(&input);
+        assert!(
+            matches!(result, Err(ParsePatchError::HunksOrder)),
+            "Expected HunksOrder error in strict mode, got {:?}",
+            result
+        );
+
+        // Lenient mode with skip_order_check should parse successfully
+        let result = parse_multiple_with_config(
+            &input,
+            ParserConfig {
+                hunk_strategy: HunkRangeStrategy::Recount,
+                skip_order_check: true,
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "Expected successful parse with lenient config"
+        );
+        let patches = result.unwrap();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].hunks().len(), 16);
     }
 
     #[test]
@@ -848,6 +887,7 @@ mod tests {
             &input,
             ParserConfig {
                 hunk_strategy: HunkRangeStrategy::Recount,
+                ..Default::default()
             },
         );
 

@@ -111,7 +111,7 @@ impl<'a> Diff<'a, str> {
     /// Parse a `Patch` from a string
     ///
     /// ```
-    /// use diffy::Diff;
+    /// use flickzeug::Diff;
     ///
     /// let s = "\
     /// --- a/ideals
