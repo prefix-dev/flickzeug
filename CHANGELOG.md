@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.3](https://github.com/prefix-dev/flickzeug/compare/v0.4.2...v0.4.3) - 2025-12-17
+
+### Fixed
+
+- install clippy & fmt with toolchain file ([#1](https://github.com/prefix-dev/flickzeug/pull/1))
+
+### Other
+
+- Add banner image to README.md
+
 ## [0.4.2] - 2025-01-29
 
 ### Added
