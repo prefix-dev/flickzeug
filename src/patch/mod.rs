@@ -264,6 +264,24 @@ pub struct Hunk<'a, T: ?Sized + ToOwned> {
     lines: Vec<Line<'a, T>>,
 }
 
+impl fmt::Display for Hunk<'_, str> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        PatchFormatter::new().fmt_hunk(self).fmt(f)
+    }
+}
+
+impl fmt::Display for Hunk<'_, [u8]> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut buf = Vec::new();
+        PatchFormatter::new()
+            .write_hunk_into(self, &mut buf)
+            .map_err(|_| fmt::Error)?;
+        // Convert to string, replacing invalid UTF-8 with replacement character
+        let s = String::from_utf8_lossy(&buf);
+        write!(f, "{}", s)
+    }
+}
+
 // We implement this trait manually, because we want specific type
 // constraints.
 impl<T> Debug for Hunk<'_, T>

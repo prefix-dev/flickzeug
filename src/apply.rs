@@ -20,7 +20,14 @@ impl fmt::Debug for ApplyError {
 
 impl fmt::Display for ApplyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "error applying hunk #{}: {}", self.0, self.1)
+        writeln!(
+            f,
+            "error applying hunk #{}: could not find context in target file",
+            self.0
+        )?;
+        writeln!(f)?;
+        writeln!(f, "Hunk content:")?;
+        write!(f, "{}", self.1)
     }
 }
 
@@ -309,7 +316,7 @@ pub fn apply_with_config(
     for (i, hunk) in diff.hunks().iter().enumerate() {
         let hunk_stats = match apply_hunk_with_config(&mut image, hunk, config) {
             Ok(stats) => stats,
-            Err(_) => return Err(ApplyError(i + 1, format!("{:#?}", hunk))),
+            Err(_) => return Err(ApplyError(i + 1, format!("{}", hunk))),
         };
         stats.add_hunk(hunk_stats);
     }
@@ -371,7 +378,7 @@ pub fn apply_bytes_with_config(
     for (i, hunk) in diff.hunks().iter().enumerate() {
         let hunk_stats = match apply_hunk_with_config(&mut image, hunk, config) {
             Ok(stats) => stats,
-            Err(_) => return Err(ApplyError(i + 1, format!("{:#?}", hunk))),
+            Err(_) => return Err(ApplyError(i + 1, format!("{}", hunk))),
         };
         stats.add_hunk(hunk_stats);
     }
@@ -630,40 +637,47 @@ where
     false
 }
 
-/// Generate combinations of context line indices to ignore
+/// Generate combinations of context line indices to ignore using GNU patch-style edge fuzz.
+///
+/// GNU patch's fuzz behavior:
+/// - fuzz 0: all context lines must match
+/// - fuzz 1: can ignore up to 1 line from start AND up to 1 line from end
+/// - fuzz 2: can ignore up to 2 lines from start AND up to 2 lines from end
+///
+/// This generates all combinations of ignoring 0..=fuzz_level lines from the start
+/// and 0..=fuzz_level lines from the end.
 fn generate_fuzz_combinations(context_indices: &[usize], fuzz_level: usize) -> Vec<Vec<usize>> {
     if fuzz_level == 0 || context_indices.is_empty() {
         return vec![vec![]];
     }
 
+    let len = context_indices.len();
     let mut combinations = Vec::new();
 
-    // Generate all combinations of size up to fuzz_level
-    for size in 0..=fuzz_level.min(context_indices.len()) {
-        combinations.extend(combinations_of_size(context_indices, size));
+    // Try all combinations of ignoring start_ignore lines from start
+    // and end_ignore lines from end
+    for start_ignore in 0..=fuzz_level.min(len) {
+        for end_ignore in 0..=fuzz_level.min(len.saturating_sub(start_ignore)) {
+            let mut ignored = Vec::new();
+
+            // Add indices to ignore from the start
+            ignored.extend(context_indices.iter().take(start_ignore).copied());
+
+            // Add indices to ignore from the end (avoiding overlap with start)
+            ignored.extend(
+                context_indices
+                    .iter()
+                    .skip(start_ignore)
+                    .rev()
+                    .take(end_ignore)
+                    .copied(),
+            );
+
+            combinations.push(ignored);
+        }
     }
 
     combinations
-}
-
-/// Generate all combinations of a specific size
-fn combinations_of_size(items: &[usize], size: usize) -> Vec<Vec<usize>> {
-    if size == 0 {
-        return vec![vec![]];
-    }
-    if size > items.len() {
-        return vec![];
-    }
-
-    let mut result = Vec::new();
-    for i in 0..=items.len() - size {
-        let first = items[i];
-        for mut rest in combinations_of_size(&items[i + 1..], size - 1) {
-            rest.insert(0, first);
-            result.push(rest);
-        }
-    }
-    result
 }
 
 /// Match lines while ignoring specified context line indices
@@ -965,5 +979,65 @@ mod test {
 "
         .replace("\n", "\r\n");
         assert_patch(old, new, expected.as_str());
+    }
+
+    #[test]
+    fn test_error_message_format() {
+        // Test that error messages show the hunk in a readable format
+        let base = "completely different content\n";
+        let patch = "\
+--- original
++++ modified
+@@ -1,3 +1,4 @@
+ line 1
+-line 2
++line 2 modified
++new line
+ line 3
+";
+        let diff = Diff::from_str(patch).unwrap();
+        let result = apply(base, &diff);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+
+        // Snapshot test the error message format
+        insta::assert_snapshot!(err_msg);
+    }
+
+    #[test]
+    fn test_tectonic_patch_with_fuzz() {
+        // Test case from real-world patch that succeeds with GNU patch-style edge fuzz.
+        // The patch expects different versions (^0.5 vs ^0.7/^0.6) but with fuzz 2,
+        // we can ignore 2 context lines from start and 2 from end, leaving only
+        // the blank line and [features] which do match.
+        let (base_image, patch) = load_files("tectonic");
+        let diff = crate::Diff::from_str(&patch).unwrap();
+        let (result, stats) = crate::apply(&base_image, &diff)
+            .expect("Patch should succeed with GNU patch-style fuzz");
+
+        // Verify the patch was applied
+        assert!(stats.has_changes());
+        assert_eq!(stats.hunks_applied, 1);
+
+        // The patch should have inserted the [patch.crates-io] section
+        assert!(
+            result.contains("[patch.crates-io]"),
+            "Patched file should contain [patch.crates-io]"
+        );
+        assert!(
+            result.contains("libz-sys"),
+            "Patched file should contain libz-sys"
+        );
+
+        // Snapshot the relevant portion around the inserted lines
+        let relevant_lines: String = result
+            .lines()
+            .skip(97) // Skip to around where the patch was applied
+            .take(10)
+            .collect::<Vec<_>>()
+            .join("\n");
+        insta::assert_snapshot!(relevant_lines);
     }
 }
