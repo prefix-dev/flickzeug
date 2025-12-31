@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.4](https://github.com/prefix-dev/flickzeug/compare/v0.4.3...v0.4.4) - 2025-12-31
+
+### Fixed
+
+- improve fuzzy patch application and improve error messages ([#3](https://github.com/prefix-dev/flickzeug/pull/3))
+
 ## [0.4.3](https://github.com/prefix-dev/flickzeug/compare/v0.4.2...v0.4.3) - 2025-12-17
 
 ### Fixed
