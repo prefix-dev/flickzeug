@@ -47,11 +47,15 @@ impl<'a, T: Text + ToOwned + ?Sized> Diff<'a, T> {
     }
 
     /// Return the name of the old file
+    ///
+    /// This includes the `a/` prefix if present.
     pub fn original(&self) -> Option<&T> {
         self.original.as_ref().map(AsRef::as_ref)
     }
 
     /// Return the name of the new file
+    ///
+    /// This includes the `b/` prefix if present.
     pub fn modified(&self) -> Option<&T> {
         self.modified.as_ref().map(AsRef::as_ref)
     }
@@ -126,6 +130,9 @@ impl<'a> Diff<'a, str> {
     /// ";
     ///
     /// let patch = Diff::from_str(s).unwrap();
+    /// assert_eq!(patch.original(), Some("a/ideals"));
+    /// assert_eq!(patch.hunks().len(), 1);
+    /// assert_eq!(patch.hunks()[0].lines().len(), 6);
     /// ```
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &'a str) -> Result<Diff<'a, str>, ParsePatchError> {
