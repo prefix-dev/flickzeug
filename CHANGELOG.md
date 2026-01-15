@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.5](https://github.com/prefix-dev/flickzeug/compare/v0.4.4...v0.4.5) - 2026-01-15
+
+### Other
+
+- Reduce MSRV to 1.88 ([#7](https://github.com/prefix-dev/flickzeug/pull/7))
+- document and doctest `Patch::original` ([#5](https://github.com/prefix-dev/flickzeug/pull/5))
+
 ## [0.4.4](https://github.com/prefix-dev/flickzeug/compare/v0.4.3...v0.4.4) - 2025-12-31
 
 ### Fixed
