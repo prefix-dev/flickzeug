@@ -1,0 +1,6 @@
+2c2
+< This is the second line.
+---
+> This is the modified second line.
+5a6
+> An added sixth line.
