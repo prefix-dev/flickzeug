@@ -8,12 +8,12 @@ Ok(
         Patch {
             original: Some(
                 Filename(
-                    "a/src/link/Coff.zig.old",
+                    "src/link/Coff.zig.old",
                 ),
             ),
             modified: Some(
                 Filename(
-                    "b/src/link/Coff.zig",
+                    "src/link/Coff.zig",
                 ),
             ),
             hunks: [

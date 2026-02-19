@@ -97,7 +97,7 @@ pub enum HunkRangeStrategy {
     Ignore,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ParserConfig {
     /// Choose what to do with hunk ranges.
     pub hunk_strategy: HunkRangeStrategy,
@@ -105,6 +105,26 @@ pub struct ParserConfig {
     /// Useful for parsing malformed patches where hunk header line numbers
     /// are incorrect but the patch content is still valid.
     pub skip_order_check: bool,
+    /// Strip conventional `a/` and `b/` prefixes from filenames.
+    ///
+    /// Many diff tools (git, `diff -u`, etc.) add `a/` and `b/` prefixes to
+    /// distinguish old vs new file sides. When `true` (the default), these
+    /// prefixes are stripped so `diff.modified()` returns `"src/file.txt"`
+    /// instead of `"b/src/file.txt"`, regardless of whether the diff is in
+    /// git format or plain unified format.
+    ///
+    /// Set to `false` to preserve the raw `a/`/`b/` prefixes in all formats.
+    pub strip_ab_prefix: bool,
+}
+
+impl Default for ParserConfig {
+    fn default() -> Self {
+        Self {
+            hunk_strategy: HunkRangeStrategy::default(),
+            skip_order_check: false,
+            strip_ab_prefix: true,
+        }
+    }
 }
 
 struct Parser<'a, T: Text + ?Sized> {
@@ -237,7 +257,8 @@ fn patch_header<'a, T: Text + ToOwned + ?Sized>(
     Option<(Cow<'a, [u8]>, Option<LineEnd>)>,
     Option<(Cow<'a, [u8]>, Option<LineEnd>)>,
 )> {
-    let (git_original, git_modified, saw_git_header) = header_preamble(parser)?;
+    let (git_original, git_modified) = header_preamble(parser)?;
+    let strip_ab_prefix = parser.config.strip_ab_prefix;
 
     let mut filename1 = None;
     let mut filename2 = None;
@@ -252,13 +273,13 @@ fn patch_header<'a, T: Text + ToOwned + ?Sized>(
                 ));
             }
             saw_traditional_header1 = true;
-            filename1 = parse_filename("--- ", parser.next()?, saw_git_header)?;
+            filename1 = parse_filename("--- ", parser.next()?, strip_ab_prefix)?;
         } else if line.starts_with("+++ ") {
             if saw_traditional_header2 {
                 return Err(ParsePatchError::HeaderMultipleLines(HeaderLineKind::Adding));
             }
             saw_traditional_header2 = true;
-            filename2 = parse_filename("+++ ", parser.next()?, saw_git_header)?;
+            filename2 = parse_filename("+++ ", parser.next()?, strip_ab_prefix)?;
         } else {
             break;
         }
@@ -284,16 +305,15 @@ fn patch_header<'a, T: Text + ToOwned + ?Sized>(
 // Parse the patch header preamble, extracting filenames from git metadata.
 // Skips preamble lines like "diff --git", git metadata, etc., until reaching
 // the first filename header ("--- " or "+++ ") or hunk line.
-// Returns extracted filenames from git metadata (for pure renames/deletes/adds)
-// and a flag indicating whether we saw a git header (for prefix stripping).
+// Returns extracted filenames from git metadata (for pure renames/deletes/adds).
 #[allow(clippy::type_complexity)]
 fn header_preamble<'a, T: Text + ToOwned + ?Sized>(
     parser: &mut Parser<'a, T>,
 ) -> Result<(
     Option<(Cow<'a, [u8]>, Option<LineEnd>)>,
     Option<(Cow<'a, [u8]>, Option<LineEnd>)>,
-    bool, // saw_git_header
 )> {
+    let strip_ab_prefix = parser.config.strip_ab_prefix;
     let mut git_original = None;
     let mut git_modified = None;
     let mut rename_from = None;
@@ -319,8 +339,9 @@ fn header_preamble<'a, T: Text + ToOwned + ?Sized>(
                 // Try to split on " b/" first to detect standard format
                 if let Some((file1, file2)) = rest.split_at_exclusive(" b/") {
                     // Standard format with b/ prefix
-                    git_original = parse_git_filename(file1, true).map(|f| (f, *end));
-                    git_modified = parse_git_filename(file2, true).map(|f| (f, *end));
+                    let has_prefix = strip_ab_prefix;
+                    git_original = parse_git_filename(file1, has_prefix).map(|f| (f, *end));
+                    git_modified = parse_git_filename(file2, has_prefix).map(|f| (f, *end));
                 } else if let Some((file1, file2)) = rest.split_at_exclusive(" ") {
                     // --no-prefix format
                     git_original = parse_git_filename(file1, false).map(|f| (f, *end));
@@ -347,14 +368,14 @@ fn header_preamble<'a, T: Text + ToOwned + ?Sized>(
     let original = rename_from.or(git_original);
     let modified = rename_to.or(git_modified);
 
-    Ok((original, modified, seen_diff_git))
+    Ok((original, modified))
 }
 
 #[allow(clippy::type_complexity)]
 fn parse_filename<'a, T: Text + ToOwned + ?Sized>(
     prefix: &str,
     l: (&'a T, Option<LineEnd>),
-    saw_git_header: bool,
+    strip_ab_prefix: bool,
 ) -> Result<Option<(Cow<'a, [u8]>, Option<LineEnd>)>> {
     let line =
         l.0.strip_prefix(prefix)
@@ -381,8 +402,8 @@ fn parse_filename<'a, T: Text + ToOwned + ?Sized>(
         unescaped_filename(filename)?
     };
 
-    // Strip a/ or b/ prefix only if we saw a git header (git format uses these prefixes)
-    if saw_git_header && let Cow::Borrowed(bytes) = parsed_filename {
+    // Strip conventional a/ or b/ prefix used by diff tools to distinguish sides
+    if strip_ab_prefix && let Cow::Borrowed(bytes) = parsed_filename {
         if let Some(rest) = std::str::from_utf8(bytes)
             .ok()
             .and_then(|s| s.strip_prefix("a/"))
@@ -841,6 +862,7 @@ mod tests {
                 ParserConfig {
                     hunk_strategy: HunkRangeStrategy::Recount,
                     skip_order_check: true,
+                    ..Default::default()
                 },
             );
             insta::assert_debug_snapshot!(patches);
@@ -868,6 +890,7 @@ mod tests {
             ParserConfig {
                 hunk_strategy: HunkRangeStrategy::Recount,
                 skip_order_check: true,
+                ..Default::default()
             },
         );
         assert!(
@@ -1128,9 +1151,9 @@ new file mode 100644
     #[test]
     fn test_traditional_unified_diff_no_git_header() {
         // Test traditional unified diff format WITHOUT git header
-        // These should NOT have a/ b/ prefixes stripped
+        // With default config (strip_ab_prefix: true), a/ b/ prefixes are stripped
         let patch = r#"--- a/old_file.txt
-+++ a/new_file.txt
++++ b/new_file.txt
 @@ -1,3 +1,3 @@
  line 1
 -old line
@@ -1141,9 +1164,107 @@ new file mode 100644
         let result = parse_multiple(patch).unwrap();
         assert_eq!(result.len(), 1);
 
-        // Without diff --git, the a/ prefix should be preserved (it's part of the actual filename)
+        // Default behavior: strip a/ b/ prefixes from plain-format diffs
+        assert_eq!(result[0].original(), Some("old_file.txt"));
+        assert_eq!(result[0].modified(), Some("new_file.txt"));
+        assert_eq!(result[0].hunks().len(), 1);
+    }
+
+    #[test]
+    fn test_traditional_unified_diff_no_strip() {
+        // Test traditional unified diff format WITHOUT git header
+        // With strip_ab_prefix: false, a/ b/ prefixes are preserved
+        let patch = r#"--- a/old_file.txt
++++ b/new_file.txt
+@@ -1,3 +1,3 @@
+ line 1
+-old line
++new line
+ line 3
+"#;
+
+        let result = parse_multiple_with_config(
+            patch,
+            ParserConfig {
+                strip_ab_prefix: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+
+        // With strip_ab_prefix: false, the a/ b/ prefix should be preserved
         assert_eq!(result[0].original(), Some("a/old_file.txt"));
-        assert_eq!(result[0].modified(), Some("a/new_file.txt"));
+        assert_eq!(result[0].modified(), Some("b/new_file.txt"));
+        assert_eq!(result[0].hunks().len(), 1);
+    }
+
+    #[test]
+    fn test_traditional_diff_no_ab_prefix() {
+        // Test plain-format diff where filenames don't have a/ b/ prefixes
+        // strip_ab_prefix should have no effect
+        let patch = r#"--- old_file.txt
++++ new_file.txt
+@@ -1,3 +1,3 @@
+ line 1
+-old line
++new line
+ line 3
+"#;
+
+        let result = parse_multiple(patch).unwrap();
+        assert_eq!(result.len(), 1);
+
+        assert_eq!(result[0].original(), Some("old_file.txt"));
+        assert_eq!(result[0].modified(), Some("new_file.txt"));
+        assert_eq!(result[0].hunks().len(), 1);
+    }
+
+    #[test]
+    fn test_strip_ab_prefix_new_file_plain_format() {
+        // Test that strip_ab_prefix works for new file creation in plain format
+        let patch = r#"--- /dev/null
++++ b/new_file.txt
+@@ -0,0 +1,3 @@
++line 1
++line 2
++line 3
+"#;
+
+        let result = parse_multiple(patch).unwrap();
+        assert_eq!(result.len(), 1);
+
+        assert_eq!(result[0].original(), None);
+        assert_eq!(result[0].modified(), Some("new_file.txt"));
+        assert_eq!(result[0].hunks().len(), 1);
+    }
+
+    #[test]
+    fn test_git_diff_no_strip() {
+        // With strip_ab_prefix: false, git-format diffs also preserve a/ b/ prefixes
+        let patch = r#"diff --git a/file.txt b/file.txt
+--- a/file.txt
++++ b/file.txt
+@@ -1,3 +1,3 @@
+ line 1
+-old line
++new line
+ line 3
+"#;
+
+        let result = parse_multiple_with_config(
+            patch,
+            ParserConfig {
+                strip_ab_prefix: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+
+        // Both git header and ---/+++ filenames should preserve a/ b/ prefixes
+        assert_eq!(result[0].original(), Some("a/file.txt"));
+        assert_eq!(result[0].modified(), Some("b/file.txt"));
         assert_eq!(result[0].hunks().len(), 1);
     }
 }
