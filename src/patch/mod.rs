@@ -130,7 +130,7 @@ impl<'a> Diff<'a, str> {
     /// ";
     ///
     /// let patch = Diff::from_str(s).unwrap();
-    /// assert_eq!(patch.original(), Some("a/ideals"));
+    /// assert_eq!(patch.original(), Some("ideals"));
     /// assert_eq!(patch.hunks().len(), 1);
     /// assert_eq!(patch.hunks()[0].lines().len(), 6);
     /// ```
