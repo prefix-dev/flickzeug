@@ -1295,6 +1295,21 @@ deleted file mode 100644
     }
 
     #[test]
+    fn test_git_diff_dev_null_new_file_git_header_only() {
+        // Test /dev/null as first file in git header without ---/+++ lines
+        // The b/ prefix should be stripped and /dev/null recognized
+        let patch = r#"diff --git /dev/null b/new_file.txt
+new file mode 100644
+"#;
+
+        let result = parse_multiple(patch).unwrap();
+        assert_eq!(result.len(), 1);
+
+        assert_eq!(result[0].original(), None);
+        assert_eq!(result[0].modified(), Some("new_file.txt"));
+    }
+
+    #[test]
     fn test_git_diff_dev_null_deleted_git_header_only() {
         // Test /dev/null as second file in git header without ---/+++ lines
         // The git header alone should correctly strip a/ and recognize /dev/null
