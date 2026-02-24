@@ -343,9 +343,14 @@ fn header_preamble<'a, T: Text + ToOwned + ?Sized>(
                     git_original = parse_git_filename(file1, has_prefix).map(|f| (f, *end));
                     git_modified = parse_git_filename(file2, has_prefix).map(|f| (f, *end));
                 } else if let Some((file1, file2)) = rest.split_at_exclusive(" ") {
-                    // --no-prefix format
-                    git_original = parse_git_filename(file1, false).map(|f| (f, *end));
-                    git_modified = parse_git_filename(file2, false).map(|f| (f, *end));
+                    // Either --no-prefix format, or one side is /dev/null which
+                    // prevents the " b/" split from matching. When /dev/null is
+                    // involved, the other file may still have a/ or b/ prefix.
+                    let has_dev_null =
+                        file1.as_bytes() == b"/dev/null" || file2.as_bytes() == b"/dev/null";
+                    let has_prefix = has_dev_null && strip_ab_prefix;
+                    git_original = parse_git_filename(file1, has_prefix).map(|f| (f, *end));
+                    git_modified = parse_git_filename(file2, has_prefix).map(|f| (f, *end));
                 }
                 // If neither split works, skip this line (malformed diff --git line)
             }
@@ -1265,6 +1270,76 @@ new file mode 100644
         // Both git header and ---/+++ filenames should preserve a/ b/ prefixes
         assert_eq!(result[0].original(), Some("a/file.txt"));
         assert_eq!(result[0].modified(), Some("b/file.txt"));
+        assert_eq!(result[0].hunks().len(), 1);
+    }
+
+    #[test]
+    fn test_git_diff_dev_null_deleted_in_git_header() {
+        // Test /dev/null as the second file in git header (deleted file)
+        // e.g., diff --git a/deleted.txt /dev/null
+        let patch = r#"diff --git a/deleted.txt /dev/null
+deleted file mode 100644
+--- a/deleted.txt
++++ /dev/null
+@@ -1,2 +0,0 @@
+-old content
+-here
+"#;
+
+        let result = parse_multiple(patch).unwrap();
+        assert_eq!(result.len(), 1);
+
+        assert_eq!(result[0].original(), Some("deleted.txt"));
+        assert_eq!(result[0].modified(), None);
+        assert_eq!(result[0].hunks().len(), 1);
+    }
+
+    #[test]
+    fn test_git_diff_dev_null_new_file_git_header_only() {
+        // Test /dev/null as first file in git header without ---/+++ lines
+        // The b/ prefix should be stripped and /dev/null recognized
+        let patch = r#"diff --git /dev/null b/new_file.txt
+new file mode 100644
+"#;
+
+        let result = parse_multiple(patch).unwrap();
+        assert_eq!(result.len(), 1);
+
+        assert_eq!(result[0].original(), None);
+        assert_eq!(result[0].modified(), Some("new_file.txt"));
+    }
+
+    #[test]
+    fn test_git_diff_dev_null_deleted_git_header_only() {
+        // Test /dev/null as second file in git header without ---/+++ lines
+        // The git header alone should correctly strip a/ and recognize /dev/null
+        let patch = r#"diff --git a/deleted.txt /dev/null
+deleted file mode 100644
+"#;
+
+        let result = parse_multiple(patch).unwrap();
+        assert_eq!(result.len(), 1);
+
+        // The a/ prefix should be stripped even when /dev/null prevents " b/" split
+        assert_eq!(result[0].original(), Some("deleted.txt"));
+        assert_eq!(result[0].modified(), None);
+    }
+
+    #[test]
+    fn test_plain_diff_dev_null_deleted() {
+        // Test plain format (no git header) with /dev/null for deleted file
+        let patch = r#"--- a/deleted.txt
++++ /dev/null
+@@ -1,2 +0,0 @@
+-old content
+-here
+"#;
+
+        let result = parse_multiple(patch).unwrap();
+        assert_eq!(result.len(), 1);
+
+        assert_eq!(result[0].original(), Some("deleted.txt"));
+        assert_eq!(result[0].modified(), None);
         assert_eq!(result[0].hunks().len(), 1);
     }
 }
