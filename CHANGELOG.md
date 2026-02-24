@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.0](https://github.com/prefix-dev/flickzeug/compare/v0.4.5...v0.5.0) - 2026-02-24
+
+### Fixed
+
+- strip `a/` and `b/` for plain patches as well ([#9](https://github.com/prefix-dev/flickzeug/pull/9))
+
 ## [0.4.5](https://github.com/prefix-dev/flickzeug/compare/v0.4.4...v0.4.5) - 2026-01-15
 
 ### Other
