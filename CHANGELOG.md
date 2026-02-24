@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.1](https://github.com/prefix-dev/flickzeug/compare/v0.5.0...v0.5.1) - 2026-02-24
+
+### Fixed
+
+- issue with a/, b/ and /dev/null ([#11](https://github.com/prefix-dev/flickzeug/pull/11))
+
 ## [0.5.0](https://github.com/prefix-dev/flickzeug/compare/v0.4.5...v0.5.0) - 2026-02-24
 
 ### Fixed
