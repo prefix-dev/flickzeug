@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.2](https://github.com/prefix-dev/flickzeug/compare/v0.5.1...v0.5.2) - 2026-03-01
+
+### Other
+
+- Add renovate.json ([#13](https://github.com/prefix-dev/flickzeug/pull/13))
+
 ## [0.5.1](https://github.com/prefix-dev/flickzeug/compare/v0.5.0...v0.5.1) - 2026-02-24
 
 ### Fixed
