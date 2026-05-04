@@ -1008,10 +1008,22 @@ mod test {
 
     #[test]
     fn test_conda_launcher_patch() {
-        // Regression test for https://github.com/prefix-dev/rattler-build/issues/2467
-        // The patch from conda/conda-launchers (cpython-launcher-c-mods-for-setuptools.3.7.patch)
-        // applied cleanly with GNU `patch -p0` but stopped applying with rattler-build after
-        // the diff engine was changed.
+        // Regression fixture for https://github.com/prefix-dev/rattler-build/issues/2467
+        //
+        // The patch from conda/conda-launchers is reported as failing under
+        // rattler-build, but flickzeug itself applies it cleanly and produces
+        // byte-identical output to GNU `patch -p0`. The actual bug lives in
+        // rattler-build's apply_patch_custom path: the recipe downloads the
+        // source as `launcher.c.orig` (`file_name: launcher.c.orig`), and the
+        // patch headers are `--- launcher.c.orig` / `+++ launcher.c`. GNU patch
+        // reads from `.orig` and writes to the bare name, but rattler-build's
+        // `normalize_backup_paths` collapses both sides to `launcher.c`,
+        // causing the file lookup to miss the existing `.orig` and fall into
+        // the "create new file from /dev/null" branch — which then fails
+        // because the hunks have non-empty context.
+        //
+        // This test guards flickzeug against ever regressing on the underlying
+        // diff so a fix in rattler-build can rely on it.
         let (base_image, patch) = load_files("conda-launcher");
         let diff = crate::Diff::from_str(&patch).unwrap();
         let (result, stats) = crate::apply(&base_image, &diff)
