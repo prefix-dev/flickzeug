@@ -1,0 +1,124 @@
+---
+source: src/apply.rs
+expression: head
+---
+/*
+ * Copyright (C) 2011-2013 Vinay Sajip.
+ * Licensed to PSF under a contributor agreement.
+ *
+ * Based on the work of:
+ *
+ * Mark Hammond (original author of Python version)
+ * Curt Hagenlocher (job management)
+ */
+
+#if defined(_MSC_VER)
+#ifdef NDEBUG
+// /Og (global optimizations), /Os (favor small code), /Oy (no frame pointers)
+#pragma optimize("gsy",on)
+
+// Note that merging the .rdata section will result in LARGER exe's if you using
+// MFC (esp. static link). If this is desirable, define _MERGE_RDATA_ in your project.
+#ifdef _MERGE_RDATA_
+#pragma comment(linker,"/merge:.rdata=.data")
+#endif // _MERGE_RDATA_
+
+#endif // NDEBUG
+#endif
+
+#include <windows.h>
+#include <shlobj.h>
+#include <stdio.h>
+#include <tchar.h>
+
+/* To build on MSYS2 use the following script:
+#!/usr/bin/env bash
+
+wget -c https://raw.githubusercontent.com/python/cpython/3.7/PC/launcher.c -O launcher.c
+patch -p0 < $(dirname ${BASH_SOURCE[0]})/cpython-launcher-c-mods-for-setuptools.3.7.patch
+RCFILE=$(dirname ${BASH_SOURCE[0]})/resources.rc
+[[ -f ${RCFILE} ]] && rm -f ${RCFILE}
+echo "#include \"winuser.h\""      > ${RCFILE}
+echo "1 RT_MANIFEST manifest.xml" >> ${RCFILE}
+for _BITS in 64 32; do
+  [[ -f resources-${_BITS}.res ]] && rm -f resources-${_BITS}.res
+  PATH=/mingw${_BITS}/bin:$PATH windres --input ${RCFILE} --output resources-${_BITS}.res --output-format=coff
+  for _TYPE in cli gui; do
+    if [[ ${_TYPE} == cli ]]; then
+      CPPFLAGS=
+      LDFLAGS=
+    else
+      CPPFLAGS="-D_WINDOWS -mwindows"
+      LDFLAGS="-mwindows"
+    fi
+    # You *could* use MSVC 2008 here, but you'd end up with much larger (~230k) executables.
+    # cl.exe -opt:nowin98 -D NDEBUG -D "GUI=0" -D "WIN32_LEAN_AND_MEAN" -ZI -Gy -MT -MERGE launcher.c -Os -link -MACHINE:x64 -SUBSYSTEM:CONSOLE version.lib advapi32.lib shell32.lib
+    PATH=/mingw${_BITS}/bin:$PATH gcc -O2 -DSCRIPT_WRAPPER -DUNICODE -D_UNICODE -DMINGW_HAS_SECURE_API ${CPPFLAGS} launcher.c -c -o ${_TYPE}-${_BITS}.o
+    PATH=/mingw${_BITS}/bin:$PATH gcc -Wl,-s --static -static-libgcc -municode ${LDFLAGS} ${_TYPE}-${_BITS}.o resources-${_BITS}.res -o ${_TYPE}-${_BITS}.exe
+  done
+done
+ls -l *.exe
+echo "Debug this from cmd.exe via:"
+echo "set PYLAUNCH_DEBUG=1"
+ */
+
+/* Previosuly GetFileVersionInfoW was used here, but I would rather save
+ * the 1.5k that costs. If we bring this back, add -lversion to the link
+ * command line.
+ */
+
+#define VERSION_HIGH 0
+#define VERSION_LOW 1
+
+/* Previously BUFSIZE was used for this but 256 is not enough for even 260
+ * ASCII characters and far too little for unicode (it is a char array, not
+ * a wchar_t array, though it needs to be even bigger than 260 wchar_ts as
+ * the source script file could contain UTF-8 or UTF-32 (wchar_t is 2-byte)
+ */
+#define SHEBANG_BUFSIZE 2048
+
+#define BUFSIZE 256
+#define MSGSIZE 1024
+
+/* Build options. */
+#define SKIP_PREFIX
+#define SEARCH_PATH
+
+/* Error codes */
+
+#define RC_NO_STD_HANDLES   100
+#define RC_CREATE_PROCESS   101
+#define RC_BAD_VIRTUAL_PATH 102
+#define RC_NO_PYTHON        103
+#define RC_NO_MEMORY        104
+/*
+ * SCRIPT_WRAPPER is used to choose one of the variants of an executable built
+ * from this source file. If not defined, the PEP 397 Python launcher is built;
+ * if defined, a script launcher of the type used by setuptools is built, which
+ * looks for a script name related to the executable name and runs that script
+ * with the appropriate Python interpreter.
+ *
+ * SCRIPT_WRAPPER should be undefined in the source, and defined in a VS project
+ * which builds the setuptools-style launcher.
+ */
+#if defined(SCRIPT_WRAPPER)
+#define RC_NO_SCRIPT        105
+#endif
+/*
+ * VENV_REDIRECT is used to choose the variant that looks for an adjacent or
+ * one-level-higher pyvenv.cfg, and uses its "home" property to locate and
+ * launch the original python.exe.
+ */
+#if defined(VENV_REDIRECT)
+#define RC_NO_VENV_CFG      106
+#define RC_BAD_VENV_CFG     107
+#endif
+
+/* Just for now - static definition */
+
+static FILE * log_fp = NULL;
+
+static wchar_t *
+skip_whitespace(wchar_t * p)
+{
+    while (*p && isspace(*p))

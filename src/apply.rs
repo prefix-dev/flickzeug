@@ -1007,6 +1007,35 @@ mod test {
     }
 
     #[test]
+    fn test_conda_launcher_patch() {
+        // Regression test for https://github.com/prefix-dev/rattler-build/issues/2467
+        // The patch from conda/conda-launchers (cpython-launcher-c-mods-for-setuptools.3.7.patch)
+        // applied cleanly with GNU `patch -p0` but stopped applying with rattler-build after
+        // the diff engine was changed.
+        let (base_image, patch) = load_files("conda-launcher");
+        let diff = crate::Diff::from_str(&patch).unwrap();
+        let (result, stats) = crate::apply(&base_image, &diff)
+            .expect("conda-launcher patch should apply (matches GNU patch -p0 behavior)");
+        assert!(stats.has_changes());
+
+        // The patch adds an `(Anaconda/Setuptools variant)` marker into the launcher
+        // help string and a `python_d` shebang entry — both are unique enough to verify.
+        assert!(
+            result.contains("(Anaconda/Setuptools variant)"),
+            "Patched launcher.c should contain the Anaconda/Setuptools marker"
+        );
+        assert!(
+            result.contains("{ L\"python_d\", FALSE },"),
+            "Patched launcher.c should contain the python_d virtual path entry"
+        );
+
+        // Snapshot the head of the patched file (where the bulk of the additions live)
+        // so any future regression in the diff engine is caught with a readable diff.
+        let head: String = result.lines().take(120).collect::<Vec<_>>().join("\n");
+        insta::assert_snapshot!(head);
+    }
+
+    #[test]
     fn test_tectonic_patch_with_fuzz() {
         // Test case from real-world patch that succeeds with GNU patch-style edge fuzz.
         // The patch expects different versions (^0.5 vs ^0.7/^0.6) but with fuzz 2,
