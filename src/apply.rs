@@ -1040,4 +1040,70 @@ mod test {
             .join("\n");
         insta::assert_snapshot!(relevant_lines);
     }
+
+    #[test]
+    fn test_create_new_file() {
+        // Test creating a new file (original is /dev/null)
+        let patch = r#"--- /dev/null
++++ b/new_file.txt
+@@ -0,0 +1,3 @@
++line 1
++line 2
++line 3
+"#;
+        let diff = Diff::from_str(patch).unwrap();
+
+        // Check parsing
+        assert_eq!(
+            diff.original(),
+            None,
+            "original should be None for /dev/null"
+        );
+        assert!(diff.modified().is_some());
+
+        // Apply to empty base (since file doesn't exist yet)
+        let (content, stats) = apply("", &diff).expect("Should apply file creation patch");
+
+        assert_eq!(content, "line 1\nline 2\nline 3\n");
+        assert_eq!(stats.lines_added, 3);
+        assert_eq!(stats.lines_deleted, 0);
+        assert!(stats.has_changes());
+    }
+
+    #[test]
+    fn test_create_file_multi_patch() {
+        // Test case from user report: multi-file patch that creates new files
+        // All files have "--- /dev/null" as the original
+        let base_folder = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test-data")
+            .join("create-file");
+        let patch = std::fs::read_to_string(base_folder.join("create_file.patch")).unwrap();
+        let diffs = crate::patch::patch_from_str(&patch).unwrap();
+
+        // This is a multi-file patch that creates new files
+        assert_eq!(diffs.len(), 9, "Should parse 9 diffs");
+
+        for (i, single_diff) in diffs.iter().enumerate() {
+            // For file creation, original should be None (from /dev/null)
+            assert_eq!(
+                single_diff.original(),
+                None,
+                "Diff {} original should be None for file creation",
+                i
+            );
+
+            // Apply to empty base image (since file doesn't exist)
+            let (content, stats) =
+                apply("", single_diff).expect(&format!("Diff {} should apply successfully", i));
+
+            // All files should have content (lines added > 0)
+            assert!(stats.lines_added > 0, "Diff {} should add lines", i);
+            assert_eq!(stats.lines_deleted, 0, "Diff {} should not delete lines", i);
+            assert!(!content.is_empty(), "Diff {} should produce content", i);
+        }
+
+        // Snapshot the first file's content
+        let (content, _) = apply("", &diffs[0]).unwrap();
+        insta::assert_snapshot!(content);
+    }
 }

@@ -1,5 +1,6 @@
 mod format;
 mod parse;
+pub mod parse_normal;
 
 pub use format::PatchFormatter;
 pub use parse::{HunkRangeStrategy, ParsePatchError, ParserConfig};
@@ -89,8 +90,15 @@ impl<T: AsRef<[u8]> + ToOwned + ?Sized> Diff<'_, T> {
     }
 }
 
+/// Parse a patch from a string.
+///
+/// Automatically detects whether the input is in unified or normal diff format.
 pub fn patch_from_str(input: &str) -> Result<Patch<'_, str>, ParsePatchError> {
-    parse::parse_multiple(input)
+    if parse_normal::is_normal_diff(input) {
+        parse_normal::parse_normal_multiple(input)
+    } else {
+        parse::parse_multiple(input)
+    }
 }
 
 pub fn patch_from_str_with_config(
@@ -100,8 +108,15 @@ pub fn patch_from_str_with_config(
     parse::parse_multiple_with_config(input, config)
 }
 
+/// Parse a patch from bytes.
+///
+/// Automatically detects whether the input is in unified or normal diff format.
 pub fn patch_from_bytes(input: &[u8]) -> Result<Patch<'_, [u8]>, ParsePatchError> {
-    parse::parse_bytes_multiple(input)
+    if parse_normal::is_normal_diff(input) {
+        parse_normal::parse_normal_bytes_multiple(input)
+    } else {
+        parse::parse_bytes_multiple(input)
+    }
 }
 
 pub fn patch_from_bytes_with_config(
@@ -113,6 +128,8 @@ pub fn patch_from_bytes_with_config(
 
 impl<'a> Diff<'a, str> {
     /// Parse a `Patch` from a string
+    ///
+    /// Automatically detects whether the input is in unified or normal diff format.
     ///
     /// ```
     /// use flickzeug::Diff;
@@ -136,14 +153,24 @@ impl<'a> Diff<'a, str> {
     /// ```
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &'a str) -> Result<Diff<'a, str>, ParsePatchError> {
-        parse::parse(s)
+        if parse_normal::is_normal_diff(s) {
+            parse_normal::parse_normal(s)
+        } else {
+            parse::parse(s)
+        }
     }
 }
 
 impl<'a> Diff<'a, [u8]> {
     /// Parse a `Patch` from bytes
+    ///
+    /// Automatically detects whether the input is in unified or normal diff format.
     pub fn from_bytes(s: &'a [u8]) -> Result<Diff<'a, [u8]>, ParsePatchError> {
-        parse::parse_bytes(s)
+        if parse_normal::is_normal_diff(s) {
+            parse_normal::parse_normal_bytes(s)
+        } else {
+            parse::parse_bytes(s)
+        }
     }
 }
 
