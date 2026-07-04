@@ -363,6 +363,134 @@ pub fn apply_bytes(base_image: &[u8], patch: &Diff<'_, [u8]>) -> ApplyResult<Vec
     apply_bytes_with_config(base_image, patch, &ApplyConfig::default())
 }
 
+/// Returns `true` if `diff` already appears to be applied to `base_image`,
+/// i.e. `base_image` already reflects the *modified* side of the diff
+/// ("reversed or previously applied", in GNU patch terms).
+///
+/// This is robust under fuzzy matching, where a *forward* apply is not a
+/// reliable signal: on already-applied content a forward apply may fail (a
+/// deleted line no longer matches) *or* succeed while wrongly re-applying the
+/// change (e.g. inserting an already-present line a second time). Instead we
+/// perform a reverse round-trip — reversing an already-applied diff must produce
+/// a *different* pre-image that, patched forward again, reproduces the input.
+///
+/// This is only meaningful for content-modifying diffs; callers should handle
+/// pure file creation/deletion/rename at the path level.
+///
+/// # Examples
+///
+/// ```
+/// use flickzeug::{is_diff_applied_with_config, ApplyConfig, Diff};
+///
+/// let patch = "\
+/// --- a/version
+/// +++ b/version
+/// @@ -1 +1 @@
+/// -3.1
+/// +3.12
+/// ";
+/// let diff = Diff::from_bytes(patch.as_bytes()).unwrap();
+/// let config = ApplyConfig::default();
+///
+/// // The diff has not been applied to the pre-image.
+/// assert!(!is_diff_applied_with_config(b"3.1\n", &diff, &config));
+/// // The diff has already been applied to the post-image.
+/// assert!(is_diff_applied_with_config(b"3.12\n", &diff, &config));
+/// ```
+pub fn is_diff_applied_with_config(
+    base_image: &[u8],
+    diff: &Diff<'_, [u8]>,
+    config: &ApplyConfig,
+) -> bool {
+    // Reverse round-trip: reversing an already-applied diff must produce a
+    // *different* pre-image that, patched forward again, reproduces the input.
+    match apply_bytes_with_config(base_image, &diff.reverse(), config) {
+        Ok((pre, _)) if pre != base_image => apply_bytes_with_config(&pre, diff, config)
+            .map(|(re, _)| re == base_image)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// The outcome of attempting to apply a diff with [`apply_bytes_reporting`].
+///
+/// This distinguishes the three cases a caller usually cares about: the diff
+/// was applied and changed the content, the diff appears to be already applied
+/// (so applying it would be a no-op), or the diff does not apply and is not
+/// already applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// The diff was applied and modified the base image. Contains the patched
+    /// image together with the [`ApplyStats`] from the application.
+    Applied(Vec<u8>, ApplyStats),
+    /// The diff appears to be already applied: `base_image` already reflects the
+    /// modified side of the diff. Contains the (unchanged) base image.
+    ///
+    /// This is detected robustly even under fuzzy matching, where a forward
+    /// apply of an already-applied diff succeeds as a no-op.
+    AlreadyApplied(Vec<u8>),
+    /// The diff could not be applied and is not already applied. Contains the
+    /// [`ApplyError`] from the failed forward application.
+    Failed(ApplyError),
+}
+
+/// Apply a non-utf8 `Diff` to a base image, reporting whether it was applied,
+/// was already applied, or failed.
+///
+/// This is a convenience wrapper around [`is_diff_applied_with_config`] and
+/// [`apply_bytes_with_config`] that answers "apply this, but if it is already
+/// applied tell me so instead of applying it again". It checks for the
+/// already-applied case *first* (via a reverse round-trip) and only forward
+/// applies when the diff is genuinely not yet applied. This ordering is
+/// necessary under fuzzy matching, where a forward apply of an already-applied
+/// diff is unreliable — it may fail, or it may succeed while wrongly
+/// re-applying the change (e.g. duplicating an inserted line).
+///
+/// # Examples
+///
+/// ```
+/// use flickzeug::{apply_bytes_reporting, ApplyConfig, ApplyOutcome, Diff};
+///
+/// let patch = "\
+/// --- a/version
+/// +++ b/version
+/// @@ -1 +1 @@
+/// -3.1
+/// +3.12
+/// ";
+/// let diff = Diff::from_bytes(patch.as_bytes()).unwrap();
+/// let config = ApplyConfig::default();
+///
+/// // Fresh content: the diff applies and changes it.
+/// assert!(matches!(
+///     apply_bytes_reporting(b"3.1\n", &diff, &config),
+///     ApplyOutcome::Applied(..)
+/// ));
+/// // Already-patched content: reported as already applied.
+/// assert!(matches!(
+///     apply_bytes_reporting(b"3.12\n", &diff, &config),
+///     ApplyOutcome::AlreadyApplied(_)
+/// ));
+/// ```
+pub fn apply_bytes_reporting(
+    base_image: &[u8],
+    diff: &Diff<'_, [u8]>,
+    config: &ApplyConfig,
+) -> ApplyOutcome {
+    // Check for the already-applied case first: a forward apply cannot be
+    // trusted to detect it (it may fail, or succeed while re-applying the
+    // change), so we must not forward apply until we know the diff is not
+    // already applied.
+    if is_diff_applied_with_config(base_image, diff, config) {
+        return ApplyOutcome::AlreadyApplied(base_image.to_vec());
+    }
+
+    match apply_bytes_with_config(base_image, diff, config) {
+        Ok((patched, stats)) => ApplyOutcome::Applied(patched, stats),
+        Err(err) => ApplyOutcome::Failed(err),
+    }
+}
+
 /// Apply a non-utf8 `Diff` to a base image with custom fuzzy matching configuration
 pub fn apply_bytes_with_config(
     base_image: &[u8],
@@ -819,7 +947,10 @@ where
 mod test {
     use std::path::PathBuf;
 
-    use crate::{Diff, apply};
+    use crate::{
+        ApplyConfig, ApplyOutcome, Diff, FuzzyConfig, apply, apply_bytes_reporting,
+        is_diff_applied_with_config,
+    };
 
     fn load_files(name: &str) -> (String, String) {
         let base_folder = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1039,5 +1170,177 @@ mod test {
             .collect::<Vec<_>>()
             .join("\n");
         insta::assert_snapshot!(relevant_lines);
+    }
+
+    /// rattler-build's configuration: fuzzy matching enabled, which is exactly
+    /// the case where a naive forward-apply check misclassifies an
+    /// already-applied diff (the forward apply succeeds as a no-op).
+    fn fuzzy_config() -> ApplyConfig {
+        ApplyConfig {
+            fuzzy_config: FuzzyConfig {
+                max_fuzz: 2,
+                ignore_whitespace: true,
+                ignore_case: false,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_is_diff_applied_line_replacement() {
+        let patch = "\
+--- a/version
++++ b/version
+@@ -1,3 +1,3 @@
+ line 1
+-3.1
++3.12
+ line 3
+";
+        let diff = Diff::from_bytes(patch.as_bytes()).unwrap();
+        let config = fuzzy_config();
+
+        let pre = b"line 1\n3.1\nline 3\n";
+        let post = b"line 1\n3.12\nline 3\n";
+
+        // Not applied to the pre-image.
+        assert!(!is_diff_applied_with_config(pre, &diff, &config));
+        // Already applied to the post-image.
+        assert!(is_diff_applied_with_config(post, &diff, &config));
+    }
+
+    #[test]
+    fn test_is_diff_applied_pure_insertion() {
+        // A hunk with only context + inserted lines (no removed lines). This is
+        // the case most likely to fool a forward-based check, because inserting
+        // already-present lines under fuzzy matching can look like a no-op.
+        let patch = "\
+--- a/list
++++ b/list
+@@ -1,3 +1,4 @@
+ first
+ second
++inserted
+ third
+";
+        let diff = Diff::from_bytes(patch.as_bytes()).unwrap();
+        let config = fuzzy_config();
+
+        let pre = b"first\nsecond\nthird\n";
+        let post = b"first\nsecond\ninserted\nthird\n";
+
+        assert!(!is_diff_applied_with_config(pre, &diff, &config));
+        assert!(is_diff_applied_with_config(post, &diff, &config));
+    }
+
+    #[test]
+    fn test_is_diff_applied_unrelated_content() {
+        let patch = "\
+--- a/version
++++ b/version
+@@ -1 +1 @@
+-3.1
++3.12
+";
+        let diff = Diff::from_bytes(patch.as_bytes()).unwrap();
+        let config = fuzzy_config();
+
+        // Neither the pre- nor the post-image: not applied.
+        assert!(!is_diff_applied_with_config(
+            b"something else entirely\n",
+            &diff,
+            &config
+        ));
+    }
+
+    #[test]
+    fn test_forward_reapply_is_unreliable_but_classifier_is_correct() {
+        // Under fuzzy matching a forward re-apply of an already-applied diff is
+        // an unreliable signal: depending on the hunk shape it either fails or
+        // succeeds while wrongly re-applying the change. The classifier must be
+        // correct regardless.
+        let config = fuzzy_config();
+
+        // Line replacement: forward re-apply FAILS (the `-3.1` delete line no
+        // longer matches the already-patched `3.12`).
+        let replace = "\
+--- a/version
++++ b/version
+@@ -1,3 +1,3 @@
+ line 1
+-3.1
++3.12
+ line 3
+";
+        let replace_diff = Diff::from_bytes(replace.as_bytes()).unwrap();
+        let replace_post = b"line 1\n3.12\nline 3\n";
+        assert!(crate::apply_bytes_with_config(replace_post, &replace_diff, &config).is_err());
+        assert!(is_diff_applied_with_config(
+            replace_post,
+            &replace_diff,
+            &config
+        ));
+
+        // Pure insertion: forward re-apply SUCCEEDS but wrongly re-inserts the
+        // already-present line, changing the content.
+        let insert = "\
+--- a/list
++++ b/list
+@@ -1,3 +1,4 @@
+ first
+ second
++inserted
+ third
+";
+        let insert_diff = Diff::from_bytes(insert.as_bytes()).unwrap();
+        let insert_post = b"first\nsecond\ninserted\nthird\n";
+        let (reapplied, _) =
+            crate::apply_bytes_with_config(insert_post, &insert_diff, &config).unwrap();
+        assert_ne!(&reapplied[..], &insert_post[..]);
+        assert!(is_diff_applied_with_config(
+            insert_post,
+            &insert_diff,
+            &config
+        ));
+    }
+
+    #[test]
+    fn test_apply_bytes_reporting_outcomes() {
+        let patch = "\
+--- a/version
++++ b/version
+@@ -1,3 +1,3 @@
+ line 1
+-3.1
++3.12
+ line 3
+";
+        let diff = Diff::from_bytes(patch.as_bytes()).unwrap();
+        let config = fuzzy_config();
+
+        let pre = b"line 1\n3.1\nline 3\n";
+        let post = b"line 1\n3.12\nline 3\n";
+
+        // Fresh content: applied and changed.
+        match apply_bytes_reporting(pre, &diff, &config) {
+            ApplyOutcome::Applied(content, stats) => {
+                assert_eq!(content, post);
+                assert!(stats.has_changes());
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+
+        // Already-patched content: reported as already applied (not a no-op
+        // "Applied", and not "Failed").
+        match apply_bytes_reporting(post, &diff, &config) {
+            ApplyOutcome::AlreadyApplied(content) => assert_eq!(content, post),
+            other => panic!("expected AlreadyApplied, got {other:?}"),
+        }
+
+        // Unrelated content: cannot apply and is not already applied.
+        match apply_bytes_reporting(b"totally different\n", &diff, &config) {
+            ApplyOutcome::Failed(_) => {}
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }

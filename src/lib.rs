@@ -229,8 +229,9 @@ mod range;
 mod utils;
 
 pub use apply::{
-    ApplyConfig, ApplyError, ApplyResult, ApplyStats, FuzzyConfig, LineEndHandling, apply,
-    apply_bytes, apply_bytes_with_config, apply_with_config,
+    ApplyConfig, ApplyError, ApplyOutcome, ApplyResult, ApplyStats, FuzzyConfig, LineEndHandling,
+    apply, apply_bytes, apply_bytes_reporting, apply_bytes_with_config, apply_with_config,
+    is_diff_applied_with_config,
 };
 pub use diff::{DiffOptions, create_patch, create_patch_bytes};
 pub use line_end::*;
