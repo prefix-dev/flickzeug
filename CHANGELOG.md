@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.3](https://github.com/prefix-dev/flickzeug/compare/v0.5.2...v0.5.3) - 2026-07-28
+
+### Fixed
+
+- detect already-applied diffs via post-image matching ([#20](https://github.com/prefix-dev/flickzeug/pull/20))
+
 ## [0.5.2](https://github.com/prefix-dev/flickzeug/compare/v0.5.1...v0.5.2) - 2026-07-04
 
 ### Added
