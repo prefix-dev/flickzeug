@@ -367,15 +367,24 @@ pub fn apply_bytes(base_image: &[u8], patch: &Diff<'_, [u8]>) -> ApplyResult<Vec
 /// i.e. `base_image` already reflects the *modified* side of the diff
 /// ("reversed or previously applied", in GNU patch terms).
 ///
-/// This is robust under fuzzy matching, where a *forward* apply is not a
-/// reliable signal: on already-applied content a forward apply may fail (a
+/// A diff counts as already applied only if every hunk's *post-image* — its
+/// context lines together with its inserted lines, in order and contiguous —
+/// is found in `base_image`. Lines are compared strictly (whitespace/case are
+/// normalized per `config`, but no similarity threshold and no fuzz applies).
+///
+/// Neither a forward apply nor a reverse round-trip is a reliable signal under
+/// fuzzy matching. On already-applied content a forward apply may fail (a
 /// deleted line no longer matches) *or* succeed while wrongly re-applying the
-/// change (e.g. inserting an already-present line a second time). Instead we
-/// perform a reverse round-trip — reversing an already-applied diff must produce
-/// a *different* pre-image that, patched forward again, reproduces the input.
+/// change (e.g. inserting an already-present line a second time). Conversely,
+/// reversing a mostly-deleting diff yields an *insertion* diff that can apply
+/// to the **un**patched content just as well (duplicating the still-present
+/// lines) and round-trip cleanly, misclassifying a not-yet-applied patch as
+/// applied. Matching the post-image directly has neither failure mode.
 ///
 /// This is only meaningful for content-modifying diffs; callers should handle
-/// pure file creation/deletion/rename at the path level.
+/// pure file creation/deletion/rename at the path level. A hunk that consists
+/// solely of deletions with no context is never reported as already applied,
+/// because nothing verifiable remains of it in the patched content.
 ///
 /// # Examples
 ///
@@ -402,14 +411,54 @@ pub fn is_diff_applied_with_config(
     diff: &Diff<'_, [u8]>,
     config: &ApplyConfig,
 ) -> bool {
-    // Reverse round-trip: reversing an already-applied diff must produce a
-    // *different* pre-image that, patched forward again, reproduces the input.
-    match apply_bytes_with_config(base_image, &diff.reverse(), config) {
-        Ok((pre, _)) if pre != base_image => apply_bytes_with_config(&pre, diff, config)
-            .map(|(re, _)| re == base_image)
-            .unwrap_or(false),
-        _ => false,
+    let hunks = diff.hunks();
+    if hunks.is_empty() {
+        return false;
     }
+
+    let image: Vec<(&[u8], Option<LineEnd>)> = LineIter::new(base_image).collect();
+
+    hunks
+        .iter()
+        .all(|hunk| find_post_image_position(&image, hunk, config).is_some())
+}
+
+/// Search `image` for a position where `hunk`'s post-image (context plus
+/// inserted lines) occurs contiguously, comparing lines strictly (equality
+/// modulo the whitespace/case normalization from `config`, without any
+/// similarity threshold). Returns `None` for hunks with an empty post-image.
+fn find_post_image_position(
+    image: &[(&[u8], Option<LineEnd>)],
+    hunk: &Hunk<'_, [u8]>,
+    config: &ApplyConfig,
+) -> Option<usize> {
+    let post_image_lines: Vec<_> = post_image(hunk.lines()).collect();
+    if post_image_lines.is_empty() {
+        return None;
+    }
+
+    let match_at = |pos: usize| -> bool {
+        image
+            .get(pos..pos + post_image_lines.len())
+            .is_some_and(|window| {
+                post_image_lines
+                    .iter()
+                    .zip(window)
+                    .all(|(post_line, image_line)| {
+                        post_line.0.similarity(image_line.0, config) >= 1.0
+                    })
+            })
+    };
+
+    // Start at the position the hunk header points at and search outward, like
+    // the pre-image search in `find_position`.
+    let pos = std::cmp::min(hunk.new_range().start().saturating_sub(1), image.len());
+    let backward = (0..pos).rev();
+    let forward = pos + 1..image.len();
+
+    iter::once(pos)
+        .chain(interleave(backward, forward))
+        .find(|&pos| match_at(pos))
 }
 
 /// The outcome of attempting to apply a diff with [`apply_bytes_reporting`].
@@ -440,8 +489,8 @@ pub enum ApplyOutcome {
 /// This is a convenience wrapper around [`is_diff_applied_with_config`] and
 /// [`apply_bytes_with_config`] that answers "apply this, but if it is already
 /// applied tell me so instead of applying it again". It checks for the
-/// already-applied case *first* (via a reverse round-trip) and only forward
-/// applies when the diff is genuinely not yet applied. This ordering is
+/// already-applied case *first* (by locating each hunk's post-image) and only
+/// forward applies when the diff is genuinely not yet applied. This ordering is
 /// necessary under fuzzy matching, where a forward apply of an already-applied
 /// diff is unreliable — it may fail, or it may succeed while wrongly
 /// re-applying the change (e.g. duplicating an inserted line).
@@ -1302,6 +1351,106 @@ mod test {
             &insert_diff,
             &config
         ));
+    }
+
+    #[test]
+    fn test_is_diff_applied_pure_deletion() {
+        // A hunk that only deletes lines. This is the case most likely to fool
+        // a reverse-round-trip check: the reversed diff is a pure insertion,
+        // which also applies to the *un*patched content (duplicating the
+        // still-present lines) and round-trips cleanly.
+        // https://github.com/prefix-dev/rattler-build/issues/2693
+        let patch = "\
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,7 +1,4 @@
+ else()
+-    if (CMAKE_BUILD_TYPE MATCHES Debug)
+-        add_compile_options(/MTd)
+-    endif()
+     add_compile_options(/utf-8)
+     add_compile_definitions(-D_CRT_SECURE_NO_WARNINGS=1)
+ endif()
+";
+        let diff = Diff::from_bytes(patch.as_bytes()).unwrap();
+        let config = fuzzy_config();
+
+        let pre = b"\
+else()
+    if (CMAKE_BUILD_TYPE MATCHES Debug)
+        add_compile_options(/MTd)
+    endif()
+    add_compile_options(/utf-8)
+    add_compile_definitions(-D_CRT_SECURE_NO_WARNINGS=1)
+endif()
+";
+        let post = b"\
+else()
+    add_compile_options(/utf-8)
+    add_compile_definitions(-D_CRT_SECURE_NO_WARNINGS=1)
+endif()
+";
+
+        // The unpatched content still contains the lines to delete: NOT applied.
+        assert!(!is_diff_applied_with_config(pre, &diff, &config));
+        // The patched content no longer contains them: already applied.
+        assert!(is_diff_applied_with_config(post, &diff, &config));
+
+        // And the reporting wrapper must actually apply it, not skip it.
+        match apply_bytes_reporting(pre, &diff, &config) {
+            ApplyOutcome::Applied(content, _) => assert_eq!(content, post),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        match apply_bytes_reporting(post, &diff, &config) {
+            ApplyOutcome::AlreadyApplied(content) => assert_eq!(content, post),
+            other => panic!("expected AlreadyApplied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_deletion_patch_with_stale_context_is_not_already_applied() {
+        // Deletion-only hunk whose trailing context does not match the file
+        // (the patch was written against a newer upstream). GNU patch rejects
+        // this; it must be reported as Failed, never as AlreadyApplied.
+        // Distilled from the libddwaf win-rt.patch case in
+        // https://github.com/prefix-dev/rattler-build/issues/2693
+        let patch = "\
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,10 +1,4 @@
+ else()
+-    if (CMAKE_BUILD_TYPE MATCHES Debug)
+-        add_compile_options(/MTd)
+-    else()
+-        add_compile_options(/MT)
+-    endif()
+-
+     add_compile_options(/utf-8)
+     add_compile_definitions(-D_CRT_SECURE_NO_WARNINGS=1)
+ endif()
+";
+        let diff = Diff::from_bytes(patch.as_bytes()).unwrap();
+        let config = fuzzy_config();
+
+        // The actual file has no `add_compile_options(/utf-8)` line, so the
+        // hunk's context can never fully match.
+        let base = b"\
+else()
+    if (CMAKE_BUILD_TYPE MATCHES Debug)
+        add_compile_options(/MTd)
+    else()
+        add_compile_options(/MT)
+    endif()
+
+    add_compile_definitions(-D_CRT_SECURE_NO_WARNINGS=1)
+endif()
+";
+
+        assert!(!is_diff_applied_with_config(base, &diff, &config));
+        match apply_bytes_reporting(base, &diff, &config) {
+            ApplyOutcome::Failed(_) => {}
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[test]
