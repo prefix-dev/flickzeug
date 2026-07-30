@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.4](https://github.com/prefix-dev/flickzeug/compare/v0.5.3...v0.5.4) - 2026-07-30
+
+### Fixed
+
+- don't misclassify deletion-only hunks as already applied ([#22](https://github.com/prefix-dev/flickzeug/pull/22))
+
 ## [0.5.3](https://github.com/prefix-dev/flickzeug/compare/v0.5.2...v0.5.3) - 2026-07-28
 
 ### Fixed
