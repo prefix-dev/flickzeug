@@ -386,6 +386,12 @@ pub fn apply_bytes(base_image: &[u8], patch: &Diff<'_, [u8]>) -> ApplyResult<Vec
 /// solely of deletions with no context is never reported as already applied,
 /// because nothing verifiable remains of it in the patched content.
 ///
+/// A hunk with deletions but no insertions needs one more check: its
+/// post-image is just its context lines, which the *un*patched content
+/// contains too (contiguously, whenever the deletions sit at the hunk's edge).
+/// Such a hunk therefore also requires that its *pre-image* — context plus
+/// deleted lines — is absent, i.e. the deleted lines are actually gone.
+///
 /// # Examples
 ///
 /// ```
@@ -420,39 +426,68 @@ pub fn is_diff_applied_with_config(
 
     hunks
         .iter()
-        .all(|hunk| find_post_image_position(&image, hunk, config).is_some())
+        .all(|hunk| is_hunk_applied(&image, hunk, config))
 }
 
-/// Search `image` for a position where `hunk`'s post-image (context plus
-/// inserted lines) occurs contiguously, comparing lines strictly (equality
-/// modulo the whitespace/case normalization from `config`, without any
-/// similarity threshold). Returns `None` for hunks with an empty post-image.
-fn find_post_image_position(
+/// Returns `true` if `hunk` appears to be already applied to `image`: its
+/// post-image occurs contiguously, and — for a hunk that deletes without
+/// inserting, whose post-image is only context lines that the unpatched
+/// content contains as well — its pre-image (context plus deleted lines)
+/// does *not* occur, i.e. the deleted lines are actually gone.
+fn is_hunk_applied(
     image: &[(&[u8], Option<LineEnd>)],
     hunk: &Hunk<'_, [u8]>,
     config: &ApplyConfig,
-) -> Option<usize> {
+) -> bool {
     let post_image_lines: Vec<_> = post_image(hunk.lines()).collect();
     if post_image_lines.is_empty() {
+        return false;
+    }
+
+    let post_start = hunk.new_range().start().saturating_sub(1);
+    if find_lines_position(image, &post_image_lines, post_start, config).is_none() {
+        return false;
+    }
+
+    let has_insertion = hunk
+        .lines()
+        .iter()
+        .any(|line| matches!(line, Line::Insert(_)));
+    if has_insertion {
+        return true;
+    }
+
+    let pre_image_lines: Vec<_> = pre_image(hunk.lines()).collect();
+    let pre_start = hunk.old_range().start().saturating_sub(1);
+    find_lines_position(image, &pre_image_lines, pre_start, config).is_none()
+}
+
+/// Search `image` for a position where `lines` occur contiguously, comparing
+/// lines strictly (equality modulo the whitespace/case normalization from
+/// `config`, without any similarity threshold). Returns `None` if `lines` is
+/// empty.
+fn find_lines_position(
+    image: &[(&[u8], Option<LineEnd>)],
+    lines: &[(&[u8], Option<LineEnd>)],
+    start_hint: usize,
+    config: &ApplyConfig,
+) -> Option<usize> {
+    if lines.is_empty() {
         return None;
     }
 
     let match_at = |pos: usize| -> bool {
-        image
-            .get(pos..pos + post_image_lines.len())
-            .is_some_and(|window| {
-                post_image_lines
-                    .iter()
-                    .zip(window)
-                    .all(|(post_line, image_line)| {
-                        post_line.0.similarity(image_line.0, config) >= 1.0
-                    })
-            })
+        image.get(pos..pos + lines.len()).is_some_and(|window| {
+            lines
+                .iter()
+                .zip(window)
+                .all(|(line, image_line)| line.0.similarity(image_line.0, config) >= 1.0)
+        })
     };
 
     // Start at the position the hunk header points at and search outward, like
     // the pre-image search in `find_position`.
-    let pos = std::cmp::min(hunk.new_range().start().saturating_sub(1), image.len());
+    let pos = std::cmp::min(start_hint, image.len());
     let backward = (0..pos).rev();
     let forward = pos + 1..image.len();
 
@@ -1404,6 +1439,97 @@ endif()
         match apply_bytes_reporting(post, &diff, &config) {
             ApplyOutcome::AlreadyApplied(content) => assert_eq!(content, post),
             other => panic!("expected AlreadyApplied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pure_deletion_without_trailing_context_is_not_already_applied() {
+        // Deletion-only hunk with leading context and NO trailing context: the
+        // post-image is just the context line, which the unpatched file also
+        // contains, so a post-image match alone must not count as applied.
+        // Distilled from php-feedstock's 0001-win-iconv-compat.patch, which
+        // empties php_iconv.def (`EXPORTS` context followed by deletions to
+        // EOF) and was silently skipped.
+        let patch = "\
+--- a/file
++++ b/file
+@@ -1,6 +1,1 @@
+ l1
+-l2
+-l3
+-l4
+-l5
+-l6
+";
+        let diff = Diff::from_bytes(patch.as_bytes()).unwrap();
+        let config = fuzzy_config();
+
+        let pre = b"l1\nl2\nl3\nl4\nl5\nl6\n";
+        let post = b"l1\n";
+
+        assert!(!is_diff_applied_with_config(pre, &diff, &config));
+        assert!(is_diff_applied_with_config(post, &diff, &config));
+
+        match apply_bytes_reporting(pre, &diff, &config) {
+            ApplyOutcome::Applied(content, _) => assert_eq!(content, post),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        match apply_bytes_reporting(post, &diff, &config) {
+            ApplyOutcome::AlreadyApplied(content) => assert_eq!(content, post),
+            other => panic!("expected AlreadyApplied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pure_deletion_mid_file_without_trailing_context_is_not_already_applied() {
+        // Same shape as above but the deletion is in the middle of the file,
+        // not at EOF.
+        let patch = "\
+--- a/file
++++ b/file
+@@ -2,2 +2,1 @@
+ l2
+-l3
+";
+        let diff = Diff::from_bytes(patch.as_bytes()).unwrap();
+        let config = fuzzy_config();
+
+        let pre = b"l1\nl2\nl3\nl4\nl5\n";
+        let post = b"l1\nl2\nl4\nl5\n";
+
+        assert!(!is_diff_applied_with_config(pre, &diff, &config));
+        assert!(is_diff_applied_with_config(post, &diff, &config));
+
+        match apply_bytes_reporting(pre, &diff, &config) {
+            ApplyOutcome::Applied(content, _) => assert_eq!(content, post),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pure_deletion_without_leading_context_is_not_already_applied() {
+        // Mirror case: deletion at the START of the hunk with only trailing
+        // context. The post-image is just the trailing context line, which the
+        // unpatched file contains as well.
+        let patch = "\
+--- a/file
++++ b/file
+@@ -2,2 +2,1 @@
+-l2
+ l3
+";
+        let diff = Diff::from_bytes(patch.as_bytes()).unwrap();
+        let config = fuzzy_config();
+
+        let pre = b"l1\nl2\nl3\n";
+        let post = b"l1\nl3\n";
+
+        assert!(!is_diff_applied_with_config(pre, &diff, &config));
+        assert!(is_diff_applied_with_config(post, &diff, &config));
+
+        match apply_bytes_reporting(pre, &diff, &config) {
+            ApplyOutcome::Applied(content, _) => assert_eq!(content, post),
+            other => panic!("expected Applied, got {other:?}"),
         }
     }
 
