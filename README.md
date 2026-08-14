@@ -82,6 +82,30 @@ let theirs = "line1\nline2\nline3 changed\n";
 let merged = merge(base, ours, theirs).unwrap();
 ```
 
+## Command line tools
+
+The optional `cli` feature builds a standalone `flickzeug` binary with
+`diff`, `apply` and `merge` subcommands built on the library:
+
+```console
+cargo install flickzeug --features cli
+
+# Print a unified diff (exit code 1 when the files differ, like GNU diff)
+flickzeug diff old.txt new.txt
+
+# Apply a (multi-file) patch with fuzzy matching; already-applied patches
+# are detected and skipped
+flickzeug apply changes.patch --directory ./src --fuzz 2
+
+# Three-way merge, argument order as in `git merge-file`
+flickzeug merge ours.txt base.txt theirs.txt
+```
+
+`apply` understands file creation (`/dev/null`), deletion, and git rename
+metadata, supports `--reverse`, `--dry-run`, `--lenient` (recount hunk
+headers) and `-p/--strip`, and exits with GNU-style status codes
+(0 success, 1 hunks failed, 2 trouble).
+
 ## License
 
 This project is available under the terms of either the [Apache 2.0 license](LICENSE-APACHE) or the [MIT license](LICENSE-MIT).

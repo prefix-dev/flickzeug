@@ -13,6 +13,7 @@ rust-version = "1.88"
 edition = "2024"
 
 [dependencies]
+clap = { version = "4.5", features = ["derive"], optional = true }
 nu-ansi-term = "0.50"
 strsim = "0.11.1"
 thiserror = "2.0.12"
@@ -20,3 +21,17 @@ thiserror = "2.0.12"
 [dev-dependencies]
 insta = { version = "1.43.1", features = ["glob"] }
 rstest = "0.26.1"
+
+[features]
+## Build the `flickzeug` command line tool (diff / apply / merge)
+cli = ["dep:clap"]
+
+[[bin]]
+name = "flickzeug"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+required-features = ["cli"]
