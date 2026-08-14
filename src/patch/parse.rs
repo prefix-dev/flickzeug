@@ -1326,6 +1326,32 @@ deleted file mode 100644
     }
 
     #[test]
+    fn test_function_context_roundtrip() {
+        // Parsing and re-formatting a hunk with a function context must be
+        // lossless: exactly one space before the context and no stray line
+        // ending inside the header line.
+        let s = "\
+--- f
++++ f
+@@ -1,3 +1,3 @@ fn main() {
+ a
+-b
++c
+ d
+";
+        let parsed = parse(s).unwrap();
+        assert_eq!(
+            parsed.hunks()[0].function_context().map(|(ctx, _)| ctx),
+            Some("fn main() {")
+        );
+        assert_eq!(parsed.to_string(), s);
+
+        // Same through the byte-oriented writer.
+        let parsed = parse_bytes(s.as_bytes()).unwrap();
+        assert_eq!(parsed.to_bytes(), s.as_bytes());
+    }
+
+    #[test]
     fn test_plain_diff_dev_null_deleted() {
         // Test plain format (no git header) with /dev/null for deleted file
         let patch = r#"--- a/deleted.txt

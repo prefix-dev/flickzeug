@@ -193,16 +193,12 @@ impl<T: AsRef<[u8]> + ?Sized + ToOwned> HunkDisplay<'_, T> {
             write!(w, "{}", self.f.hunk_header.suffix())?;
         }
 
-        if let Some((ctx, ending)) = self.hunk.function_context {
+        if let Some((ctx, _ending)) = self.hunk.function_context {
             write!(w, " ")?;
             if self.f.with_color {
                 write!(w, "{}", self.f.function_context.prefix())?;
             }
-            write!(w, " ")?;
             w.write_all(ctx.as_ref())?;
-            if let Some(end) = ending {
-                w.write_all(end.into())?;
-            }
             if self.f.with_color {
                 write!(w, "{}", self.f.function_context.suffix())?;
             }
@@ -227,16 +223,12 @@ impl Display for HunkDisplay<'_, str> {
             write!(f, "{}", self.f.hunk_header.suffix())?;
         }
 
-        if let Some((ctx, ending)) = self.hunk.function_context {
+        if let Some((ctx, _ending)) = self.hunk.function_context {
             write!(f, " ")?;
             if self.f.with_color {
                 write!(f, "{}", self.f.function_context.prefix())?;
             }
-            write!(f, " {}", ctx)?;
-            if let Some(end) = ending {
-                let s: &str = end.into();
-                write!(f, "{}", s)?;
-            }
+            write!(f, "{}", ctx)?;
             if self.f.with_color {
                 write!(f, "{}", self.f.function_context.suffix())?;
             }
