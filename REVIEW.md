@@ -53,7 +53,7 @@ parsed and re-emitted (error messages, `Diff::to_string`, `to_bytes`) was
 affected. Fixed in `src/patch/format.rs` for both the `Display` and the
 `io::Write` paths; roundtrip test added.
 
-### 1.3 Applying a patch rewrites line endings of untouched lines — **open, needs a decision**
+### 1.3 Applying a patch rewrites line endings of untouched lines — **fixed in this branch**
 
 The default `LineEndHandling::EnsureFileLineEnding` computes the *most common*
 line ending of the input and then rewrites **every** line of the output with
@@ -72,12 +72,15 @@ normalizing a mixed-endings file can produce noisy rebuilds and broken
 checksums. The `// TODO: Keep line ending as is like it was before.` comments
 in `apply.rs` suggest this is known.
 
-**Recommendation:** add a `KeepOriginal` variant (each line keeps the ending
-it had; inserted lines inherit the ending of the neighbouring context, falling
-back to the hunk's dominant ending) and make it the default on the next
-breaking release. The three existing "Ensure*" modes remain as opt-ins.
+**Resolution:** `LineEndHandling::KeepOriginal` is now the default: untouched
+lines are copied byte for byte, and inserted lines inherit the ending of the
+closest retained line *only when* the patch's endings demonstrably disagree
+with the file's at the match site (an LF patch on a CRLF file) — when they
+agree, the patch's endings are authoritative, which keeps
+`apply(a, create_patch(a, b)) == b` exact. The three "Ensure*" modes remain as
+opt-ins.
 
-### 1.4 A malformed hunk mid-diff is silently swallowed — **open**
+### 1.4 A malformed hunk mid-diff is silently swallowed — **fixed in this branch**
 
 `parse::hunks()` treats *any* hunk parse error as "end of this file's hunks"
 (the `// TODO: Handle properly` in `parse.rs:513`):
@@ -89,15 +92,15 @@ assert_eq!(d.hunks().len(), 1);          // second hunk silently dropped
 ```
 
 A truncated patch then applies "successfully" while doing half the job — for a
-patching pipeline that is arguably worse than the panic in 1.1. The swallow is
-load-bearing (it is how `parse_multiple` finds the end of one file's hunks
-before the next `diff --git`/`---` header), so the fix is to distinguish
-"line that legitimately starts the next section" (`diff --git `, `--- `,
-`Index: `, `From `, EOF …) from "line that parses as neither hunk content nor
-a section start", and return an error for the latter. Related: the *bytes*
-variant of `parse_multiple` breaks out of the loop on `(Err, Err)` where the
-*str* variant returns the error — the two front ends should behave
-identically.
+patching pipeline that is arguably worse than the panic in 1.1.
+
+**Resolution:** hunks unambiguously start with `@@ `, so only such lines are
+parsed as hunks and any error *inside* a started hunk now propagates; other
+lines end the current file's hunks (the next `diff --git`/`---` header in a
+multi-file patch). The str and bytes front ends now share one parse loop with
+identical error semantics (the bytes variant used to swallow errors), and the
+single-diff front ends accept header-only diffs (pure renames, identical
+files) the way `parse_multiple` always did.
 
 ### 1.5 README examples didn't compile — **fixed in this branch**
 
@@ -110,7 +113,7 @@ verified by being an actual compiling doctest-style snippet.
 
 ## 2. Correctness & semantics concerns (not yet bugs, but worth deciding deliberately)
 
-* **The fuzzy similarity threshold is a hard-coded 0.8** (`FuzzyComparable::fuzzy_eq`).
+* **The fuzzy similarity threshold is a hard-coded 0.8** (`FuzzyComparable::fuzzy_eq`). *(fixed in this branch: `FuzzyConfig::similarity_threshold`, and deleted lines always require normalized equality)*
   Whenever fuzz level ≥ 1 kicks in, *every non-ignored context line — and
   every deleted line —* only needs 80% Levenshtein similarity to "match".
   GNU patch never does this: fuzz only *ignores* edge context lines, all other
@@ -308,18 +311,25 @@ Design notes and where to take it:
 
 ## 7. Suggested roadmap
 
-| Priority | Item | Size |
+| Priority | Item | Status |
 |---|---|---|
-| P0 | ~~`LineIter` CR panic + data loss~~ (fixed here) | S |
-| P0 | ~~Function-context roundtrip~~ (fixed here) | S |
-| P0 | Stop silently dropping malformed hunks (§1.4) + align str/bytes front ends | M |
-| P1 | Line-ending preservation for untouched lines, new default (§1.3) | M |
-| P1 | Fuzzing targets + proptest roundtrips (§5) | S |
-| P1 | Windows/macOS CI matrix; MSRV job compiles tests | S |
-| P1 | Hoist per-hunk work out of the fuzzy position loop; borrow in `similarity`; memchr (§3) | M |
-| P2 | Configurable similarity threshold; exact match for delete lines (§2) | S |
-| P2 | `Patch` newtype + file-set apply helpers; `.rej` output for the CLI (§4, §6) | M |
-| P2 | Structured errors with positions; expose git metadata; optional `nu-ansi-term` | M |
-| P3 | Merge labels + typed conflict result; criterion benches; true `--recount` | M |
+| P0 | `LineIter` CR panic + data loss | **done** |
+| P0 | Function-context roundtrip | **done** |
+| P0 | Stop silently dropping malformed hunks (§1.4) + align str/bytes front ends | **done** |
+| P1 | Line-ending preservation for untouched lines, new default (§1.3) | **done** |
+| P1 | Fuzzing targets + randomized roundtrip invariants (§5) | **done** |
+| P1 | Windows/macOS CI matrix; MSRV job compiles tests | **done** |
+| P1 | Hoist per-hunk work out of the fuzzy position loop; allocation-free comparisons; memchr (§3) | **done** |
+| P2 | Configurable similarity threshold; exact match for delete lines (§2) | **done** |
+| P2 | Optional `nu-ansi-term` (`color` feature); merge conflict labels; error accessors; str parity APIs | **done** |
+| P2 | GNU/git end-to-end compatibility suite (byte-identical diff/merge output, cross-application, exit codes) | **done** |
+| P2 | `Patch` newtype + file-set apply helpers; `.rej` output for the CLI (§4, §6) | open |
+| P2 | Structured parse errors with line numbers; expose git metadata (rename/create/delete/mode) | open |
+| P3 | Typed merge conflict result; criterion benches; true `--recount` | open |
 
-*(S ≈ an evening, M ≈ a day or two.)*
+The compatibility suite (`tests/compat.rs`) is the guardrail for everything
+above: unified diff output is byte-identical to GNU diff on the curated
+corpus, merges are byte-identical to `git merge-file` (both styles), patches
+cross-apply in both directions with GNU patch and `git apply`, and exit codes
+match. It immediately paid for itself by catching a real bug (a
+trailing-newline-only diff misclassified as already applied).

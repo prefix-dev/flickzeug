@@ -106,6 +106,19 @@ metadata, supports `--reverse`, `--dry-run`, `--lenient` (recount hunk
 headers) and `-p/--strip`, and exits with GNU-style status codes
 (0 success, 1 hunks failed, 2 trouble).
 
+Compatibility with the reference tools is tested end-to-end
+(`tests/compat.rs`): unified diff output is byte-identical to GNU diff,
+merge output is byte-identical to `git merge-file` (merge and diff3
+styles), patches cross-apply in both directions with GNU `patch` and
+`git apply`, and exit codes match.
+
+## Cargo features
+
+- `color` *(default)* — colored patch formatting via `nu-ansi-term`
+  (`PatchFormatter::with_color`). Disable with `default-features = false`
+  if you only need the library.
+- `cli` — builds the `flickzeug` binary described above.
+
 ## License
 
 This project is available under the terms of either the [Apache 2.0 license](LICENSE-APACHE) or the [MIT license](LICENSE-MIT).
