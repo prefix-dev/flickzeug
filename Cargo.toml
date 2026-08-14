@@ -15,7 +15,7 @@ edition = "2024"
 [dependencies]
 clap = { version = "4.5", features = ["derive"], optional = true }
 memchr = "2.7"
-nu-ansi-term = "0.50"
+nu-ansi-term = { version = "0.50", optional = true }
 strsim = "0.11.1"
 thiserror = "2.0.12"
 
@@ -24,8 +24,11 @@ insta = { version = "1.43.1", features = ["glob"] }
 rstest = "0.26.1"
 
 [features]
+default = ["color"]
+## Colored patch formatting (PatchFormatter::with_color)
+color = ["dep:nu-ansi-term"]
 ## Build the `flickzeug` command line tool (diff / apply / merge)
-cli = ["dep:clap"]
+cli = ["dep:clap", "color"]
 
 [[bin]]
 name = "flickzeug"

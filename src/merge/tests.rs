@@ -1,5 +1,20 @@
 use super::*;
 
+#[test]
+fn conflict_labels_are_configurable() {
+    let base = "a\nb\nc\n";
+    let ours = "A\nb\nc\n";
+    let theirs = "AA\nb\nc\n";
+
+    let mut options = MergeOptions::new();
+    options.set_conflict_labels("feature-branch", "base.txt", "main");
+    let conflict = options.merge(base, ours, theirs).unwrap_err();
+
+    assert!(conflict.contains("<<<<<<< feature-branch"), "{conflict}");
+    assert!(conflict.contains("||||||| base.txt"), "{conflict}");
+    assert!(conflict.contains(">>>>>>> main"), "{conflict}");
+}
+
 macro_rules! assert_merge {
     ($original:ident, $ours:ident, $theirs:ident, $kind:ident($expected:expr), $msg:literal $(,)?) => {
         let solution = merge($original, $ours, $theirs);

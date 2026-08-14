@@ -4,7 +4,7 @@ use crate::{
     range::{DiffRange, Range, SliceLike},
     utils::Classifier,
 };
-use std::{cmp, fmt};
+use std::{borrow::Cow, cmp, fmt};
 
 #[cfg(test)]
 mod tests;
@@ -113,11 +113,31 @@ pub enum ConflictStyle {
     Diff3,
 }
 
+/// The labels printed after the conflict markers, like the `-L` options of
+/// `git merge-file` / `diff3 -m`.
+#[derive(Debug, Clone)]
+struct ConflictLabels {
+    ours: Cow<'static, str>,
+    original: Cow<'static, str>,
+    theirs: Cow<'static, str>,
+}
+
+impl Default for ConflictLabels {
+    fn default() -> Self {
+        Self {
+            ours: "ours".into(),
+            original: "original".into(),
+            theirs: "theirs".into(),
+        }
+    }
+}
+
 /// A collection of options for modifying the way a merge is performed
 #[derive(Debug)]
 pub struct MergeOptions {
     conflict_marker_length: usize,
     style: ConflictStyle,
+    labels: ConflictLabels,
 }
 
 impl MergeOptions {
@@ -126,10 +146,12 @@ impl MergeOptions {
     /// ## Defaults
     /// * conflict_marker_length = 7
     /// * style = ConflictStyle::Diff3
+    /// * labels = "ours" / "original" / "theirs"
     pub fn new() -> Self {
         Self {
             conflict_marker_length: DEFAULT_CONFLICT_MARKER_LENGTH,
             style: ConflictStyle::Diff3,
+            labels: ConflictLabels::default(),
         }
     }
 
@@ -142,6 +164,23 @@ impl MergeOptions {
     /// Set the conflict style used when displaying a merge conflict
     pub fn set_conflict_style(&mut self, style: ConflictStyle) -> &mut Self {
         self.style = style;
+        self
+    }
+
+    /// Set the labels printed after the conflict markers, replacing the
+    /// default `ours` / `original` / `theirs` — like the `-L` options of
+    /// `git merge-file` (typically branch or file names).
+    pub fn set_conflict_labels(
+        &mut self,
+        ours: impl Into<Cow<'static, str>>,
+        original: impl Into<Cow<'static, str>>,
+        theirs: impl Into<Cow<'static, str>>,
+    ) -> &mut Self {
+        self.labels = ConflictLabels {
+            ours: ours.into(),
+            original: original.into(),
+            theirs: theirs.into(),
+        };
         self
     }
 
@@ -173,6 +212,7 @@ impl MergeOptions {
             &merge,
             self.conflict_marker_length,
             self.style,
+            &self.labels,
         )
     }
 
@@ -204,6 +244,7 @@ impl MergeOptions {
             &merge,
             self.conflict_marker_length,
             self.style,
+            &self.labels,
         )
     }
 }
@@ -491,6 +532,7 @@ fn cleanup_conflicts<'ancestor, 'ours, 'theirs, T: ?Sized + SliceLike + PartialE
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn output_result<'a, T: ?Sized>(
     ancestor: &[(&'a str, Option<LineEnd>)],
     ours: &[(&'a str, Option<LineEnd>)],
@@ -498,6 +540,7 @@ fn output_result<'a, T: ?Sized>(
     merge: &[MergeRange<T>],
     marker_len: usize,
     style: ConflictStyle,
+    labels: &ConflictLabels,
 ) -> Result<String, String> {
     let mut conflicts = 0;
     let mut output = String::new();
@@ -514,7 +557,7 @@ fn output_result<'a, T: ?Sized>(
                 }
             }
             MergeRange::Conflict(ancestor_range, ours_range, theirs_range) => {
-                add_conflict_marker(&mut output, '<', marker_len, Some("ours"));
+                add_conflict_marker(&mut output, '<', marker_len, Some(&labels.ours));
                 for (line, end) in ours[ours_range.range()].iter() {
                     output.push_str(line);
                     if let Some(e) = *end {
@@ -524,7 +567,7 @@ fn output_result<'a, T: ?Sized>(
                 }
 
                 if let ConflictStyle::Diff3 = style {
-                    add_conflict_marker(&mut output, '|', marker_len, Some("original"));
+                    add_conflict_marker(&mut output, '|', marker_len, Some(&labels.original));
                     for (line, end) in ancestor[ancestor_range.range()].iter() {
                         output.push_str(line);
                         if let Some(e) = *end {
@@ -542,7 +585,7 @@ fn output_result<'a, T: ?Sized>(
                         output.push_str(s);
                     }
                 }
-                add_conflict_marker(&mut output, '>', marker_len, Some("theirs"));
+                add_conflict_marker(&mut output, '>', marker_len, Some(&labels.theirs));
                 conflicts += 1;
             }
             MergeRange::Ours(range) => {
@@ -607,6 +650,7 @@ fn output_extend_bytes(output: &mut Vec<u8>, (line, end): (&[u8], Option<LineEnd
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn output_result_bytes<'a, T: ?Sized>(
     ancestor: &[(&'a [u8], Option<LineEnd>)],
     ours: &[(&'a [u8], Option<LineEnd>)],
@@ -614,6 +658,7 @@ fn output_result_bytes<'a, T: ?Sized>(
     merge: &[MergeRange<T>],
     marker_len: usize,
     style: ConflictStyle,
+    labels: &ConflictLabels,
 ) -> Result<Vec<u8>, Vec<u8>> {
     let mut conflicts = 0;
     let mut output: Vec<u8> = Vec::new();
@@ -626,13 +671,23 @@ fn output_result_bytes<'a, T: ?Sized>(
                     .for_each(|line| output_extend_bytes(&mut output, *line));
             }
             MergeRange::Conflict(ancestor_range, ours_range, theirs_range) => {
-                add_conflict_marker_bytes(&mut output, b'<', marker_len, Some(b"ours"));
+                add_conflict_marker_bytes(
+                    &mut output,
+                    b'<',
+                    marker_len,
+                    Some(labels.ours.as_bytes()),
+                );
                 ours[ours_range.range()]
                     .iter()
                     .for_each(|line| output_extend_bytes(&mut output, *line));
 
                 if let ConflictStyle::Diff3 = style {
-                    add_conflict_marker_bytes(&mut output, b'|', marker_len, Some(b"original"));
+                    add_conflict_marker_bytes(
+                        &mut output,
+                        b'|',
+                        marker_len,
+                        Some(labels.original.as_bytes()),
+                    );
                     ancestor[ancestor_range.range()]
                         .iter()
                         .for_each(|line| output_extend_bytes(&mut output, *line));
@@ -642,7 +697,12 @@ fn output_result_bytes<'a, T: ?Sized>(
                 theirs[theirs_range.range()]
                     .iter()
                     .for_each(|line| output_extend_bytes(&mut output, *line));
-                add_conflict_marker_bytes(&mut output, b'>', marker_len, Some(b"theirs"));
+                add_conflict_marker_bytes(
+                    &mut output,
+                    b'>',
+                    marker_len,
+                    Some(labels.theirs.as_bytes()),
+                );
                 conflicts += 1;
             }
             MergeRange::Ours(range) => {

@@ -30,9 +30,9 @@ impl fmt::Display for HeaderLineKind {
     }
 }
 
-/// An error returned when parsing a `Patch` using [`Patch::from_str`] fails
+/// An error returned when parsing a patch (e.g. via [`Diff::from_str`]) fails
 ///
-/// [`Patch::from_str`]: struct.Patch.html#method.from_str
+/// [`Diff::from_str`]: crate::Diff::from_str
 #[derive(thiserror::Error, Debug)]
 pub enum ParsePatchError {
     #[error("unexpected end of file")]

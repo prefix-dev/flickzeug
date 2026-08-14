@@ -74,10 +74,13 @@
 //! // Without color
 //! print!("{}", patch);
 //!
-//! // With color
+//! // With color (requires the default `color` feature)
 //! # use flickzeug::PatchFormatter;
+//! # #[cfg(feature = "color")]
+//! # {
 //! let f = PatchFormatter::new().with_color();
 //! print!("{}", f.fmt_patch(&patch));
+//! # }
 //! ```
 //!
 //! ```console
@@ -214,11 +217,7 @@
 //! [Unified Format]: https://en.wikipedia.org/wiki/Diff#Unified_format
 //! [diff3]: https://en.wikipedia.org/wiki/Diff3
 //!
-//! [`Display`]: https://doc.rust-lang.org/stable/std/fmt/trait.Display.html
-//! [`Patch`]: struct.Patch.html
-//! [`PatchFormatter`]: struct.PatchFormatter.html
-//! [`create_patch`]: fn.create_patch.html
-//! [`create_patch_bytes`]: fn.create_patch_bytes.html
+//! [`Display`]: std::fmt::Display
 
 mod apply;
 mod diff;
