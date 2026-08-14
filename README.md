@@ -30,7 +30,7 @@ Add `flickzeug` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-flickzeug = "0.4"
+flickzeug = "0.5"
 ```
 
 ### Creating a diff
@@ -48,14 +48,27 @@ println!("{}", patch);
 ### Applying a patch
 
 ```rust
-use flickzeug::{apply, Patch};
+use flickzeug::{apply, Diff};
 
 let original = "The quick brown fox\njumps over\nthe lazy dog.\n";
-let patch_text = "..."; // unified diff format
+let patch_text = "\
+--- a/fox
++++ b/fox
+@@ -1,3 +1,3 @@
+ The quick brown fox
+ jumps over
+-the lazy dog.
++the sleepy dog.
+";
 
-let patch = Patch::from_str(patch_text).unwrap();
-let result = apply(original, &patch).unwrap();
+let diff = Diff::from_str(patch_text).unwrap();
+let (result, stats) = apply(original, &diff).unwrap();
+assert_eq!(result, "The quick brown fox\njumps over\nthe sleepy dog.\n");
+assert!(stats.has_changes());
 ```
+
+To parse a patch that touches multiple files, use `patch_from_str` /
+`patch_from_bytes`, which return a `Vec` of per-file `Diff`s.
 
 ### Three-way merge
 
