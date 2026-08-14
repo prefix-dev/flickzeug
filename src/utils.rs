@@ -238,9 +238,8 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     }
 }
 
-// XXX Maybe use `memchr`?
 fn find_byte(haystack: &[u8], byte: u8) -> Option<usize> {
-    haystack.iter().position(|&b| b == byte)
+    memchr::memchr(byte, haystack)
 }
 
 #[cfg(test)]
