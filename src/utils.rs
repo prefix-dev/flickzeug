@@ -72,10 +72,12 @@ impl<'a, T: Text + ?Sized> Iterator for LineIter<'a, T> {
         let (mut line, remaining) = self.0.split_at(end);
         if line_ending.is_some() {
             line = self.0.split_at(end - 1).0;
-        }
-        if self.0.as_bytes().get(end.saturating_sub(2)) == Some(&b'\r') {
-            line_ending = Some(LineEnd::CrLf);
-            line = self.0.split_at(end - 2).0;
+            // Only look for a `\r` that directly precedes a found `\n`; a `\r`
+            // anywhere else (e.g. in a final line without a newline) is content.
+            if end >= 2 && self.0.as_bytes().get(end - 2) == Some(&b'\r') {
+                line_ending = Some(LineEnd::CrLf);
+                line = self.0.split_at(end - 2).0;
+            }
         }
 
         self.0 = remaining;
@@ -239,4 +241,55 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // XXX Maybe use `memchr`?
 fn find_byte(haystack: &[u8], byte: u8) -> Option<usize> {
     haystack.iter().position(|&b| b == byte)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LineIter;
+    use crate::LineEnd;
+
+    #[test]
+    fn line_iter_lf_and_crlf() {
+        let lines: Vec<_> = LineIter::new("a\nb\r\nc\n").collect();
+        assert_eq!(
+            lines,
+            vec![
+                ("a", Some(LineEnd::Lf)),
+                ("b", Some(LineEnd::CrLf)),
+                ("c", Some(LineEnd::Lf)),
+            ]
+        );
+    }
+
+    #[test]
+    fn line_iter_lone_cr_is_content() {
+        // A lone `\r` must not panic and must be treated as content.
+        let lines: Vec<_> = LineIter::new("\r").collect();
+        assert_eq!(lines, vec![("\r", None)]);
+    }
+
+    #[test]
+    fn line_iter_final_line_with_cr_is_not_truncated() {
+        // A final line without a trailing newline whose second-to-last byte is
+        // `\r` must be returned verbatim, not truncated to a fabricated CRLF.
+        let lines: Vec<_> = LineIter::new("foo\rx").collect();
+        assert_eq!(lines, vec![("foo\rx", None)]);
+
+        let lines: Vec<_> = LineIter::new("a\nfoo\rx").collect();
+        assert_eq!(lines, vec![("a", Some(LineEnd::Lf)), ("foo\rx", None)]);
+    }
+
+    #[test]
+    fn line_iter_final_line_with_trailing_cr() {
+        // A trailing `\r` without `\n` is content, not a line ending.
+        let lines: Vec<_> = LineIter::new("x\r").collect();
+        assert_eq!(lines, vec![("x\r", None)]);
+    }
+
+    #[test]
+    fn line_iter_cr_only_terminated_by_lf() {
+        // `\r` immediately followed by `\n` is a CRLF ending even at the start.
+        let lines: Vec<_> = LineIter::new("\r\n").collect();
+        assert_eq!(lines, vec![("", Some(LineEnd::CrLf))]);
+    }
 }
