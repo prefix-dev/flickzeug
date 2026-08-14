@@ -36,9 +36,9 @@ impl PatchFormatter {
             with_color: false,
             with_missing_newline_message: true,
 
-            // TODO the default in git-diff and GNU diff is to have this set to false, on the next
-            // semver breaking release we should contemplate switching this to be false by default
-            suppress_blank_empty: true,
+            // git-diff and GNU diff print a space before empty context
+            // lines; suppressing it is opt-in (diff.suppressBlankEmpty)
+            suppress_blank_empty: false,
 
             #[cfg(feature = "color")]
             styles: Styles {
@@ -74,7 +74,7 @@ impl PatchFormatter {
 
     /// Sets whether to suppress printing of a space before empty lines.
     ///
-    /// Defaults to `true`.
+    /// Defaults to `false`, matching git-diff and GNU diff.
     ///
     /// For more information you can refer to the [Omitting trailing blanks] manual page of GNU
     /// diff or the [diff.suppressBlankEmpty] config for `git-diff`.

@@ -209,7 +209,12 @@ fn resolve_target(directory: &Path, name: &[u8], strip: usize) -> Result<PathBuf
         }
     }
 
-    Ok(directory.join(path))
+    // Avoid a cosmetic "./" prefix in messages when patching the current dir
+    if directory == Path::new(".") {
+        Ok(path)
+    } else {
+        Ok(directory.join(path))
+    }
 }
 
 fn run_apply(

@@ -601,10 +601,14 @@ where
 
     let match_at = |pos: usize| -> bool {
         image.get(pos..pos + lines.len()).is_some_and(|window| {
-            lines
-                .iter()
-                .zip(window)
-                .all(|(line, image_line)| line.0.normalized_eq(image_line.0, config))
+            lines.iter().zip(window).all(|(line, image_line)| {
+                // Whether a line ending exists is semantic (the "\ No newline
+                // at end of file" marker): a diff that only adds or removes
+                // the trailing newline must not count as already applied.
+                // Which ending it is (LF vs CRLF) is convention and ignored.
+                line.1.is_some() == image_line.1.is_some()
+                    && line.0.normalized_eq(image_line.0, config)
+            })
         })
     };
 
@@ -756,8 +760,7 @@ where
         // patch's inserted endings are authoritative — this keeps
         // apply(a, create_patch(a, b)) == b exact even for files that mix
         // line endings.
-        let inherit_insert_endings =
-            keep_original && !patch_endings_match_file(image, hunk, pos);
+        let inherit_insert_endings = keep_original && !patch_endings_match_file(image, hunk, pos);
 
         // Preserve original context lines (and, with KeepOriginal, their
         // line endings), only apply insertions/deletions
@@ -1880,6 +1883,40 @@ endif()
         match apply_bytes_reporting(b"totally different\n", &diff, &config) {
             ApplyOutcome::Failed(_) => {}
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trailing_newline_only_diff_is_not_already_applied() {
+        // Found by the GNU compat suite: a diff whose only change is adding
+        // the trailing newline was judged already-applied (content-only
+        // post-image matching) and skipped.
+        let patch = "\
+--- a/f
++++ b/f
+@@ -1,3 +1,3 @@
+ alpha
+ beta
+-gamma
+\\ No newline at end of file
++gamma
+";
+        let diff = Diff::from_bytes(patch.as_bytes()).unwrap();
+        let config = fuzzy_config();
+
+        let pre = b"alpha\nbeta\ngamma";
+        let post = b"alpha\nbeta\ngamma\n";
+
+        assert!(!is_diff_applied_with_config(pre, &diff, &config));
+        assert!(is_diff_applied_with_config(post, &diff, &config));
+
+        match apply_bytes_reporting(pre, &diff, &config) {
+            ApplyOutcome::Applied(content, _) => assert_eq!(content, post),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        match apply_bytes_reporting(post, &diff, &config) {
+            ApplyOutcome::AlreadyApplied(content) => assert_eq!(content, post),
+            other => panic!("expected AlreadyApplied, got {other:?}"),
         }
     }
 

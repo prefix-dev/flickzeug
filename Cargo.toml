@@ -40,3 +40,8 @@ required-features = ["cli"]
 name = "cli"
 path = "tests/cli.rs"
 required-features = ["cli"]
+
+[[test]]
+name = "compat"
+path = "tests/compat.rs"
+required-features = ["cli"]
