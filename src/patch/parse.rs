@@ -205,12 +205,30 @@ where
 pub fn parse(input: &str) -> Result<Diff<'_, str>> {
     let mut parser = Parser::new(input);
     let header = patch_header(&mut parser)?;
-    let hunks = hunks(&mut parser)?;
+    let hunks = parse_hunks_allowing_empty(&mut parser, &header)?;
 
     let original = header.0.map(|(line, _end)| convert_cow_to_str(line));
     let modified = header.1.map(|(line, _end)| convert_cow_to_str(line));
 
     Ok(Diff::new(original, modified, hunks))
+}
+
+// A diff that has filename headers but no hunks is valid (a pure rename, a
+// metadata-only change, or a diff between identical files); `parse_multiple`
+// accepts these, so the single-diff front ends do too.
+#[allow(clippy::type_complexity)]
+fn parse_hunks_allowing_empty<'a, T: Text + ?Sized + ToOwned>(
+    parser: &mut Parser<'a, T>,
+    header: &(
+        Option<(Cow<'a, [u8]>, Option<LineEnd>)>,
+        Option<(Cow<'a, [u8]>, Option<LineEnd>)>,
+    ),
+) -> Result<Vec<Hunk<'a, T>>> {
+    match hunks(parser) {
+        Ok(hunks) => Ok(hunks),
+        Err(ParsePatchError::NoHunks) if header.0.is_some() || header.1.is_some() => Ok(vec![]),
+        Err(err) => Err(err),
+    }
 }
 
 pub fn parse_bytes_multiple(input: &[u8]) -> Result<Vec<Diff<'_, [u8]>>> {
@@ -227,7 +245,7 @@ pub fn parse_bytes_multiple_with_config(
 pub fn parse_bytes(input: &[u8]) -> Result<Diff<'_, [u8]>> {
     let mut parser = Parser::new(input);
     let header = patch_header(&mut parser)?;
-    let hunks = hunks(&mut parser)?;
+    let hunks = parse_hunks_allowing_empty(&mut parser, &header)?;
 
     let original = header.0.map(|(line, _end)| line);
     let modified = header.1.map(|(line, _end)| line);

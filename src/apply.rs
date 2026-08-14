@@ -750,9 +750,18 @@ where
             post_image(hunk.lines()).map(ImageLine::Patched),
         );
     } else {
+        // Only remap the endings of inserted lines when the patch's endings
+        // demonstrably disagree with the file's at the match site (an LF
+        // patch applied to a CRLF file, or vice versa). When they agree, the
+        // patch's inserted endings are authoritative — this keeps
+        // apply(a, create_patch(a, b)) == b exact even for files that mix
+        // line endings.
+        let inherit_insert_endings =
+            keep_original && !patch_endings_match_file(image, hunk, pos);
+
         // Preserve original context lines (and, with KeepOriginal, their
         // line endings), only apply insertions/deletions
-        apply_hunk_preserving_context(image, hunk, pos, keep_original, file_line_ending);
+        apply_hunk_preserving_context(image, hunk, pos, inherit_insert_endings, file_line_ending);
     }
 
     Ok(HunkStats {
@@ -760,6 +769,32 @@ where
         deleted,
         context,
     })
+}
+
+/// Returns `true` when every context/deleted line of `hunk` that has a line
+/// ending in the patch agrees with the ending of the image line it matched.
+/// When they all agree the patch was written with the file's line-ending
+/// convention and its inserted endings can be trusted verbatim.
+fn patch_endings_match_file<T>(image: &[ImageLine<T>], hunk: &Hunk<'_, T>, pos: usize) -> bool
+where
+    T: ?Sized + Text + ToOwned,
+{
+    let mut offset = 0;
+    for line in hunk.lines() {
+        match *line {
+            Line::Context((_, end)) | Line::Delete((_, end)) => {
+                if let Some(image_line) = image.get(pos + offset) {
+                    let image_end = image_line.inner().1;
+                    if end.is_some() && image_end.is_some() && end != image_end {
+                        return false;
+                    }
+                }
+                offset += 1;
+            }
+            Line::Insert(_) => {}
+        }
+    }
+    true
 }
 
 /// Apply hunk while preserving original context lines.

@@ -11,6 +11,7 @@ keywords = ["diff", "patch", "merge"]
 categories = ["text-processing"]
 rust-version = "1.88"
 edition = "2024"
+exclude = ["fuzz/", ".github/"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"], optional = true }
