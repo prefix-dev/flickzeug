@@ -44,6 +44,26 @@ fn have(tool: &str) -> bool {
     found
 }
 
+/// The `patch` on Windows CI runners is Strawberry Perl's patch 2.5.9 from
+/// 2003, which crashes on valid patches and uses different exit codes.
+/// Only a modern GNU patch (which identifies as "GNU patch x.y") is a
+/// meaningful comparison target.
+fn have_gnu_patch() -> bool {
+    let Ok(out) = Command::new("patch").arg("--version").output() else {
+        eprintln!("skipping: `patch` not available");
+        return false;
+    };
+    let version = String::from_utf8_lossy(&out.stdout);
+    let modern = out.status.success() && version.contains("GNU patch");
+    if !modern {
+        eprintln!(
+            "skipping: `patch` is not a modern GNU patch ({})",
+            version.lines().next().unwrap_or("unknown")
+        );
+    }
+    modern
+}
+
 fn run(cmd: &mut Command) -> Output {
     cmd.output()
         .unwrap_or_else(|err| panic!("failed to run {cmd:?}: {err}"))
@@ -182,7 +202,7 @@ fn diff_exit_codes_match_gnu_diff() {
 /// diffs with flickzeug apply — both reproducing the target file exactly.
 #[test]
 fn cross_apply_with_gnu_patch() {
-    if !have("diff") || !have("patch") {
+    if !have("diff") || !have_gnu_patch() {
         return;
     }
 
@@ -247,7 +267,7 @@ fn cross_apply_with_gnu_patch() {
 /// both tools.
 #[test]
 fn apply_with_offset_matches_gnu_patch() {
-    if !have("diff") || !have("patch") {
+    if !have("diff") || !have_gnu_patch() {
         return;
     }
 
@@ -292,7 +312,7 @@ fn apply_with_offset_matches_gnu_patch() {
 /// Reverse application must agree with `patch -R`.
 #[test]
 fn reverse_apply_matches_gnu_patch() {
-    if !have("diff") || !have("patch") {
+    if !have("diff") || !have_gnu_patch() {
         return;
     }
 
@@ -334,7 +354,7 @@ fn reverse_apply_matches_gnu_patch() {
 /// A patch that does not apply must fail with exit code 1 in both tools.
 #[test]
 fn failed_apply_exit_codes_match_gnu_patch() {
-    if !have("patch") {
+    if !have_gnu_patch() {
         return;
     }
 
@@ -377,7 +397,10 @@ fn cross_apply_with_git() {
     let repo = dir.join("repo");
     fs::create_dir_all(&repo).unwrap();
     let git = |args: &[&str]| {
+        // Git for Windows defaults to core.autocrlf=true, which would rewrite
+        // the LF fixtures to CRLF on checkout; keep the repo byte-exact.
         let out = run(Command::new("git")
+            .args(["-c", "core.autocrlf=false"])
             .args(args)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
@@ -423,7 +446,7 @@ fn cross_apply_with_git() {
     fs::write(dir.join("flick.patch"), patch_text).unwrap();
 
     let git_apply = run(Command::new("git")
-        .args(["apply", "../flick.patch"])
+        .args(["-c", "core.autocrlf=false", "apply", "../flick.patch"])
         .current_dir(&repo));
     assert!(
         git_apply.status.success(),
