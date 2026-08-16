@@ -1,0 +1,5 @@
+# Line endings are semantic for a diff/patch library: test fixtures and
+# snapshots must be checked out byte-for-byte as committed on every platform
+# (Windows runners default to core.autocrlf, which would rewrite them to CRLF
+# and break the parse snapshots).
+* -text
