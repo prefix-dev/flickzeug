@@ -25,7 +25,8 @@ use std::{
 };
 
 use crate::{
-    ApplyConfig, ApplyOutcome, ApplyStats, Diff, Patch, apply_bytes_partial, apply_bytes_reporting,
+    ApplyConfig, ApplyStats, Diff, PartialApply, Patch, apply_bytes_partial,
+    is_diff_applied_with_config,
 };
 
 /// Options for [`apply_patch_dir`]
@@ -119,6 +120,10 @@ pub enum DirApplyError {
     /// A file name in the patch is not valid UTF-8
     #[error("patch contains a non-UTF-8 file name")]
     NonUtf8Filename,
+    /// A diff has hunks but neither an old nor a new file name to apply them
+    /// to (a headerless patch)
+    #[error("diff has hunks but no file names")]
+    MissingFilenames,
     /// Stripping [`DirApplyOptions::strip`] components left nothing
     #[error("nothing left of file name {0:?} after stripping {1} leading components")]
     EmptyFilename(String, usize),
@@ -144,7 +149,9 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> DirApplyError + '_ {
 }
 
 /// Resolve a file name from the patch against `directory`, stripping `strip`
-/// leading components and rejecting absolute paths and `..` components.
+/// leading components and rejecting absolute paths, `..` components, and
+/// paths that pass through a symlink (which could escape the directory the
+/// way CVE-2018-1000156 did for GNU patch; `git apply` refuses these too).
 fn resolve_path(directory: &Path, name: &[u8], strip: usize) -> Result<PathBuf, DirApplyError> {
     let name = std::str::from_utf8(name).map_err(|_| DirApplyError::NonUtf8Filename)?;
     let path: PathBuf = Path::new(name).components().skip(strip).collect();
@@ -156,6 +163,20 @@ fn resolve_path(directory: &Path, name: &[u8], strip: usize) -> Result<PathBuf, 
         match component {
             Component::Normal(_) | Component::CurDir => {}
             _ => return Err(DirApplyError::UnsafePath(name.to_owned())),
+        }
+    }
+
+    // No prefix of the path below `directory` — nor the file itself — may be
+    // a symlink: writing through one would escape the target directory.
+    let mut current = if directory == Path::new(".") {
+        PathBuf::new()
+    } else {
+        directory.to_path_buf()
+    };
+    for component in path.components() {
+        current.push(component);
+        if std::fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(DirApplyError::UnsafePath(name.to_owned()));
         }
     }
 
@@ -210,7 +231,7 @@ pub fn apply_patch_dir(
             .transpose()?;
 
         match (original, modified) {
-            (None, None) => {}
+            (None, None) => return Err(DirApplyError::MissingFilenames),
             // Pure rename or metadata-only diff without hunks
             (Some(from), Some(to)) if diff.hunks().is_empty() => {
                 if from == to {
@@ -233,27 +254,37 @@ pub fn apply_patch_dir(
             }
             // File deletion: apply the hunks and remove the file if empty
             (Some(from), None) => {
+                // The file being gone is what this diff wants: re-applying a
+                // patch that contains deletions must not abort
+                if !from.exists() {
+                    report.push(AppliedFile {
+                        path: from,
+                        outcome: FileOutcome::AlreadyApplied,
+                    });
+                    continue;
+                }
                 let base = std::fs::read(&from).map_err(io_err(&from))?;
-                let outcome = match apply_bytes_reporting(&base, diff, &options.apply_config) {
-                    ApplyOutcome::Applied(content, _) if content.is_empty() => {
+                let outcome = if is_diff_applied_with_config(&base, diff, &options.apply_config) {
+                    FileOutcome::AlreadyApplied
+                } else {
+                    let partial = apply_bytes_partial(&base, diff, &options.apply_config);
+                    if !partial.rejected.is_empty() {
+                        reject_outcome(diff, &from, partial, false, options)?
+                    } else if partial.content.is_empty() {
                         if !options.dry_run {
                             std::fs::remove_file(&from).map_err(io_err(&from))?;
                         }
                         FileOutcome::Deleted
-                    }
-                    // The diff claims deletion but content remains: keep the
-                    // patched file (GNU patch behaves the same without -E)
-                    ApplyOutcome::Applied(content, stats) => {
-                        if !options.dry_run {
-                            std::fs::write(&from, content).map_err(io_err(&from))?;
-                        }
+                    } else {
+                        // The diff claims deletion but content remains: keep
+                        // the patched file (GNU patch behaves the same
+                        // without -E)
+                        write_file(&from, &partial.content, options)?;
                         FileOutcome::Patched {
-                            stats,
+                            stats: partial.stats,
                             created: false,
                         }
                     }
-                    ApplyOutcome::AlreadyApplied(_) => FileOutcome::AlreadyApplied,
-                    ApplyOutcome::Failed(_) => reject_outcome(diff, &from, &base, options)?,
                 };
                 report.push(AppliedFile {
                     path: from,
@@ -271,13 +302,19 @@ pub fn apply_patch_dir(
                     Some(path) => std::fs::read(path).map_err(io_err(path))?,
                     None => Vec::new(),
                 };
-                let outcome = apply_one(diff, &to, &base, source.is_some(), options)?;
+                // For a rename the move must happen even when hunks reject
+                // (like `git apply --reject`), so the target is force-written
+                // and the rejects land next to it — never delete the source
+                // without having written the target.
+                let is_rename = original.as_ref().is_some_and(|from| *from != to);
+                let outcome = apply_one(diff, &to, &base, source.is_some(), is_rename, options)?;
 
-                // A rename with content changes: the patched content was
-                // written to `to`; remove the old file
+                // A rename with content changes: the patched (or, with
+                // rejects, force-written) content is at `to`; remove the old
+                // file
                 if !matches!(outcome, FileOutcome::AlreadyApplied)
+                    && is_rename
                     && let Some(from) = &original
-                    && *from != to
                     && from.exists()
                     && !options.dry_run
                 {
@@ -292,56 +329,62 @@ pub fn apply_patch_dir(
     Ok(report)
 }
 
+/// Write `content` to `target`, creating parent directories (no-op in dry
+/// runs).
+fn write_file(
+    target: &Path,
+    content: &[u8],
+    options: &DirApplyOptions,
+) -> Result<(), DirApplyError> {
+    if options.dry_run {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(io_err(target))?;
+    }
+    std::fs::write(target, content).map_err(io_err(target))
+}
+
 /// Apply one diff against `base` and write the result to `target`,
 /// GNU patch-style: what fits is applied, the rest goes to `<target>.rej`.
+/// `force_write` writes the target even when nothing applied (renames must
+/// complete the move before the source is removed).
 fn apply_one(
     diff: &Diff<'_, [u8]>,
     target: &Path,
     base: &[u8],
     target_existed: bool,
+    force_write: bool,
     options: &DirApplyOptions,
 ) -> Result<FileOutcome, DirApplyError> {
-    let write = |content: &[u8]| -> Result<(), DirApplyError> {
-        if options.dry_run {
-            return Ok(());
-        }
-        if let Some(parent) = target.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(io_err(target))?;
-        }
-        std::fs::write(target, content).map_err(io_err(target))
-    };
-
-    match apply_bytes_reporting(base, diff, &options.apply_config) {
-        ApplyOutcome::Applied(content, stats) => {
-            write(&content)?;
-            Ok(FileOutcome::Patched {
-                stats,
-                created: !target_existed,
-            })
-        }
-        ApplyOutcome::AlreadyApplied(_) => Ok(FileOutcome::AlreadyApplied),
-        ApplyOutcome::Failed(_) => reject_outcome(diff, target, base, options),
+    if is_diff_applied_with_config(base, diff, &options.apply_config) {
+        return Ok(FileOutcome::AlreadyApplied);
     }
+
+    let partial = apply_bytes_partial(base, diff, &options.apply_config);
+    if partial.rejected.is_empty() {
+        write_file(target, &partial.content, options)?;
+        return Ok(FileOutcome::Patched {
+            stats: partial.stats,
+            created: !target_existed,
+        });
+    }
+    reject_outcome(diff, target, partial, force_write, options)
 }
 
-/// GNU patch behavior for a diff whose hunks do not all apply: apply the ones
+/// GNU patch behavior for a diff whose hunks do not all apply: keep the ones
 /// that fit, save the rest to `<target>.rej`.
 fn reject_outcome(
     diff: &Diff<'_, [u8]>,
     target: &Path,
-    base: &[u8],
+    partial: PartialApply<'_, [u8], Vec<u8>>,
+    force_write: bool,
     options: &DirApplyOptions,
 ) -> Result<FileOutcome, DirApplyError> {
-    let partial = apply_bytes_partial(base, diff, &options.apply_config);
-    if partial.stats.hunks_applied > 0 && !options.dry_run {
-        if let Some(parent) = target.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(io_err(target))?;
-        }
-        std::fs::write(target, &partial.content).map_err(io_err(target))?;
+    if partial.stats.hunks_applied > 0 || force_write {
+        write_file(target, &partial.content, options)?;
     }
 
     let reject_file = if options.write_rejects && !options.dry_run {
@@ -499,6 +542,104 @@ rename to new-name.txt
             reject,
             "--- f.txt\n+++ f.txt\n@@ -8,3 +8,3 @@\n WRONG\n-CONTEXT\n+NOPE\n HERE\n"
         );
+    }
+
+    #[test]
+    fn rename_with_rejected_hunks_does_not_lose_data() {
+        // Adversarial-review finding: a rename whose hunks all reject used to
+        // delete the source without ever writing the target.
+        let dir = scratch_dir("rename-reject");
+        std::fs::write(dir.join("old.txt"), "keep this content\n").unwrap();
+
+        let patch_text = "\
+diff --git a/old.txt b/new.txt
+rename from old.txt
+rename to new.txt
+--- a/old.txt
++++ b/new.txt
+@@ -1,3 +1,3 @@
+ context that
+-does not exist
++will not match
+ anywhere here
+";
+        let patch = Patch::from_bytes(patch_text.as_bytes()).unwrap();
+        let report = apply_patch_dir(&dir, &patch, &DirApplyOptions::default()).unwrap();
+
+        assert!(report[0].outcome.is_failure());
+        // The move completed (like git apply --reject): content is preserved
+        // at the new name, rejects live next to it
+        assert!(!dir.join("old.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("new.txt")).unwrap(),
+            "keep this content\n"
+        );
+        assert!(dir.join("new.txt.rej").exists());
+    }
+
+    #[test]
+    fn reapplying_a_deletion_is_already_applied() {
+        // Adversarial-review finding: a deletion diff for an already-deleted
+        // file used to abort the whole application with an I/O error.
+        let dir = scratch_dir("re-delete");
+        std::fs::write(dir.join("gone.txt"), "bye\n").unwrap();
+        let patch_text = "\
+--- a/gone.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-bye
+";
+        let patch = Patch::from_bytes(patch_text.as_bytes()).unwrap();
+
+        let report = apply_patch_dir(&dir, &patch, &DirApplyOptions::default()).unwrap();
+        assert_eq!(report[0].outcome, FileOutcome::Deleted);
+
+        let report = apply_patch_dir(&dir, &patch, &DirApplyOptions::default()).unwrap();
+        assert_eq!(report[0].outcome, FileOutcome::AlreadyApplied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paths_through_symlinks_are_rejected() {
+        // Adversarial-review finding: a symlink inside the tree could route a
+        // write outside the target directory (CVE-2018-1000156 class).
+        let dir = scratch_dir("symlink");
+        let outside = scratch_dir("symlink-outside");
+        std::os::unix::fs::symlink(&outside, dir.join("sub")).unwrap();
+
+        // Through a symlinked directory
+        let patch_text = "\
+--- /dev/null
++++ b/sub/evil.txt
+@@ -0,0 +1 @@
++gotcha
+";
+        let patch = Patch::from_bytes(patch_text.as_bytes()).unwrap();
+        let err = apply_patch_dir(&dir, &patch, &DirApplyOptions::default()).unwrap_err();
+        assert!(matches!(err, DirApplyError::UnsafePath(_)), "{err}");
+        assert!(!outside.join("evil.txt").exists());
+
+        // A symlinked file itself
+        std::fs::write(outside.join("target.txt"), "x\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("target.txt"), dir.join("f.txt")).unwrap();
+        let patch_text = "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-x\n+y\n";
+        let patch = Patch::from_bytes(patch_text.as_bytes()).unwrap();
+        let err = apply_patch_dir(&dir, &patch, &DirApplyOptions::default()).unwrap_err();
+        assert!(matches!(err, DirApplyError::UnsafePath(_)), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("target.txt")).unwrap(),
+            "x\n"
+        );
+    }
+
+    #[test]
+    fn headerless_hunks_are_an_error() {
+        // Adversarial-review finding: a diff with hunks but no file names was
+        // silently skipped, making the whole application a successful no-op.
+        let dir = scratch_dir("headerless");
+        let patch = Patch::from_bytes(b"@@ -1 +1 @@\n-x\n+y\n").unwrap();
+        let err = apply_patch_dir(&dir, &patch, &DirApplyOptions::default()).unwrap_err();
+        assert!(matches!(err, DirApplyError::MissingFilenames), "{err}");
     }
 
     #[test]

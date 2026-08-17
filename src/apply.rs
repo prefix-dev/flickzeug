@@ -353,8 +353,12 @@ pub fn apply_with_config(
     config: &ApplyConfig,
 ) -> ApplyResult<String, ApplyError> {
     let (lines, stats) = apply_all(base_image, diff, config)?;
+    Ok((assemble_str(lines, base_image.len()), stats))
+}
 
-    let mut content = String::with_capacity(base_image.len());
+/// Concatenate resolved output lines into a `String`
+fn assemble_str(lines: OutputLines<'_, str>, capacity: usize) -> String {
+    let mut content = String::with_capacity(capacity);
     for (line, ending) in lines {
         content.push_str(line);
         if let Some(ending) = ending {
@@ -362,8 +366,20 @@ pub fn apply_with_config(
             content.push_str(e);
         }
     }
+    content
+}
 
-    Ok((content, stats))
+/// Concatenate resolved output lines into a `Vec<u8>`
+fn assemble_bytes(lines: OutputLines<'_, [u8]>, capacity: usize) -> Vec<u8> {
+    let mut content = Vec::with_capacity(capacity);
+    for (line, ending) in lines {
+        content.extend_from_slice(line);
+        if let Some(ending) = ending {
+            let e: &[u8] = ending.into();
+            content.extend_from_slice(e);
+        }
+    }
+    content
 }
 
 /// Apply a non-utf8 `Diff` to a base image with default fuzzy matching
@@ -378,17 +394,7 @@ pub fn apply_bytes_with_config(
     config: &ApplyConfig,
 ) -> ApplyResult<Vec<u8>, ApplyError> {
     let (lines, stats) = apply_all(base_image, diff, config)?;
-
-    let mut content = Vec::with_capacity(base_image.len());
-    for (line, ending) in lines {
-        content.extend_from_slice(line);
-        if let Some(ending) = ending {
-            let e: &[u8] = ending.into();
-            content.extend_from_slice(e);
-        }
-    }
-
-    Ok((content, stats))
+    Ok((assemble_bytes(lines, base_image.len()), stats))
 }
 
 /// A patched file as resolved output lines: the line's content and the line
@@ -528,18 +534,8 @@ pub fn apply_partial<'a>(
     config: &ApplyConfig,
 ) -> PartialApply<'a, str, String> {
     let (lines, stats, rejected) = apply_all_partial(base_image, diff, config);
-
-    let mut content = String::with_capacity(base_image.len());
-    for (line, ending) in lines {
-        content.push_str(line);
-        if let Some(ending) = ending {
-            let e: &str = ending.into();
-            content.push_str(e);
-        }
-    }
-
     PartialApply {
-        content,
+        content: assemble_str(lines, base_image.len()),
         stats,
         rejected: rejected.into_iter().map(|(_, hunk)| hunk).collect(),
     }
@@ -552,18 +548,8 @@ pub fn apply_bytes_partial<'a>(
     config: &ApplyConfig,
 ) -> PartialApply<'a, [u8], Vec<u8>> {
     let (lines, stats, rejected) = apply_all_partial(base_image, diff, config);
-
-    let mut content = Vec::with_capacity(base_image.len());
-    for (line, ending) in lines {
-        content.extend_from_slice(line);
-        if let Some(ending) = ending {
-            let e: &[u8] = ending.into();
-            content.extend_from_slice(e);
-        }
-    }
-
     PartialApply {
-        content,
+        content: assemble_bytes(lines, base_image.len()),
         stats,
         rejected: rejected.into_iter().map(|(_, hunk)| hunk).collect(),
     }
@@ -883,18 +869,26 @@ where
 /// ending in the patch agrees with the ending of the image line it matched.
 /// When they all agree the patch was written with the file's line-ending
 /// convention and its inserted endings can be trusted verbatim.
+///
+/// A hunk with no comparable endings at all (e.g. an insert-only `-U0` hunk)
+/// provides no evidence either way and returns `false`, so inserted lines
+/// inherit from their neighbors as the `KeepOriginal` documentation promises.
 fn patch_endings_match_file<T>(image: &[ImageLine<T>], hunk: &Hunk<'_, T>, pos: usize) -> bool
 where
     T: ?Sized + Text + ToOwned,
 {
+    let mut saw_comparison = false;
     let mut offset = 0;
     for line in hunk.lines() {
         match *line {
             Line::Context((_, end)) | Line::Delete((_, end)) => {
                 if let Some(image_line) = image.get(pos + offset) {
                     let image_end = image_line.inner().1;
-                    if end.is_some() && image_end.is_some() && end != image_end {
-                        return false;
+                    if end.is_some() && image_end.is_some() {
+                        saw_comparison = true;
+                        if end != image_end {
+                            return false;
+                        }
                     }
                 }
                 offset += 1;
@@ -902,7 +896,7 @@ where
             Line::Insert(_) => {}
         }
     }
-    true
+    saw_comparison
 }
 
 /// Apply hunk while preserving original context lines.
@@ -1465,6 +1459,23 @@ mod test {
         let diff = Diff::from_str(patch).unwrap();
         let (out, _) = apply(base, &diff).unwrap();
         assert_eq!(out, "one\r\ntwo\r\ntwo and a half\r\nthree\r\n");
+    }
+
+    #[test]
+    fn keep_original_zero_context_insert_inherits_ending() {
+        // Adversarial-review finding: an insert-only hunk (-U0 style) has no
+        // context/delete endings to compare, so the patch's endings were
+        // trusted vacuously and an LF line was inserted into a CRLF file.
+        let base = "one\r\ntwo\r\nthree\r\n";
+        let patch = "\
+--- a
++++ b
+@@ -1,0 +2 @@
++inserted
+";
+        let diff = Diff::from_str(patch).unwrap();
+        let (out, _) = apply(base, &diff).unwrap();
+        assert_eq!(out, "one\r\ninserted\r\ntwo\r\nthree\r\n");
     }
 
     #[test]
