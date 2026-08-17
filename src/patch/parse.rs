@@ -30,9 +30,9 @@ impl fmt::Display for HeaderLineKind {
     }
 }
 
-/// An error returned when parsing a `Patch` using [`Patch::from_str`] fails
+/// An error returned when parsing a patch (e.g. via [`Diff::from_str`]) fails
 ///
-/// [`Patch::from_str`]: struct.Patch.html#method.from_str
+/// [`Diff::from_str`]: crate::Diff::from_str
 #[derive(thiserror::Error, Debug)]
 pub enum ParsePatchError {
     #[error("unexpected end of file")]
@@ -159,22 +159,39 @@ pub fn parse_multiple(input: &str) -> Result<Vec<Diff<'_, str>>> {
 }
 
 pub fn parse_multiple_with_config(input: &str, config: ParserConfig) -> Result<Vec<Diff<'_, str>>> {
+    parse_multiple_generic(input, config, convert_cow_to_str)
+}
+
+// The shared multi-file parse loop. `convert` maps the raw filename bytes to
+// the target text type, everything else — including the error semantics — is
+// identical for the str and bytes front ends.
+fn parse_multiple_generic<'a, T, C, O>(
+    input: &'a T,
+    config: ParserConfig,
+    convert: C,
+) -> Result<Vec<Diff<'a, T>>>
+where
+    T: Text + ToOwned + ?Sized,
+    C: Fn(Cow<'a, [u8]>) -> O,
+    O: Into<Cow<'a, T>>,
+{
     let mut parser = Parser::with_config(input, config);
     let mut patches = vec![];
     loop {
         match (patch_header(&mut parser), hunks(&mut parser)) {
             (Ok(header), Ok(hunks)) => {
-                let original = header.0.map(|(line, _end)| convert_cow_to_str(line));
-                let modified = header.1.map(|(line, _end)| convert_cow_to_str(line));
+                let original = header.0.map(|(line, _end)| convert(line));
+                let modified = header.1.map(|(line, _end)| convert(line));
                 patches.push(Diff::new(original, modified, hunks))
             }
-            (Ok((None, None)), Err(_)) => break,
+            // No header and no hunks left: end of input (or trailing junk)
+            (Ok((None, None)), Err(ParsePatchError::NoHunks)) => break,
             // Allow NoHunks error when we have valid headers (pure renames/deletes/adds)
             (Ok(header), Err(ParsePatchError::NoHunks))
                 if header.0.is_some() || header.1.is_some() =>
             {
-                let original = header.0.map(|(line, _end)| convert_cow_to_str(line));
-                let modified = header.1.map(|(line, _end)| convert_cow_to_str(line));
+                let original = header.0.map(|(line, _end)| convert(line));
+                let modified = header.1.map(|(line, _end)| convert(line));
                 patches.push(Diff::new(original, modified, vec![]))
             }
             (Ok(_), Err(e)) | (Err(e), _) => {
@@ -188,12 +205,30 @@ pub fn parse_multiple_with_config(input: &str, config: ParserConfig) -> Result<V
 pub fn parse(input: &str) -> Result<Diff<'_, str>> {
     let mut parser = Parser::new(input);
     let header = patch_header(&mut parser)?;
-    let hunks = hunks(&mut parser)?;
+    let hunks = parse_hunks_allowing_empty(&mut parser, &header)?;
 
     let original = header.0.map(|(line, _end)| convert_cow_to_str(line));
     let modified = header.1.map(|(line, _end)| convert_cow_to_str(line));
 
     Ok(Diff::new(original, modified, hunks))
+}
+
+// A diff that has filename headers but no hunks is valid (a pure rename, a
+// metadata-only change, or a diff between identical files); `parse_multiple`
+// accepts these, so the single-diff front ends do too.
+#[allow(clippy::type_complexity)]
+fn parse_hunks_allowing_empty<'a, T: Text + ?Sized + ToOwned>(
+    parser: &mut Parser<'a, T>,
+    header: &(
+        Option<(Cow<'a, [u8]>, Option<LineEnd>)>,
+        Option<(Cow<'a, [u8]>, Option<LineEnd>)>,
+    ),
+) -> Result<Vec<Hunk<'a, T>>> {
+    match hunks(parser) {
+        Ok(hunks) => Ok(hunks),
+        Err(ParsePatchError::NoHunks) if header.0.is_some() || header.1.is_some() => Ok(vec![]),
+        Err(err) => Err(err),
+    }
 }
 
 pub fn parse_bytes_multiple(input: &[u8]) -> Result<Vec<Diff<'_, [u8]>>> {
@@ -204,37 +239,13 @@ pub fn parse_bytes_multiple_with_config(
     input: &[u8],
     config: ParserConfig,
 ) -> Result<Vec<Diff<'_, [u8]>>> {
-    let mut parser = Parser::with_config(input, config);
-    let mut patches = vec![];
-    loop {
-        match (patch_header(&mut parser), hunks(&mut parser)) {
-            (Ok(header), Ok(hunks)) => {
-                let original = header.0.map(|(line, _end)| line);
-                let modified = header.1.map(|(line, _end)| line);
-
-                patches.push(Diff::new(original, modified, hunks))
-            }
-            (Ok((None, None)), Err(_)) | (Err(_), Err(_)) => break,
-            // Allow NoHunks error when we have valid headers (pure renames/deletes/adds)
-            (Ok(header), Err(ParsePatchError::NoHunks))
-                if header.0.is_some() || header.1.is_some() =>
-            {
-                let original = header.0.map(|(line, _end)| line);
-                let modified = header.1.map(|(line, _end)| line);
-                patches.push(Diff::new(original, modified, vec![]))
-            }
-            (Ok(_), Err(e)) | (Err(e), Ok(_)) => {
-                return Err(e);
-            }
-        }
-    }
-    Ok(patches)
+    parse_multiple_generic(input, config, |line| line)
 }
 
 pub fn parse_bytes(input: &[u8]) -> Result<Diff<'_, [u8]>> {
     let mut parser = Parser::new(input);
     let header = patch_header(&mut parser)?;
-    let hunks = hunks(&mut parser)?;
+    let hunks = parse_hunks_allowing_empty(&mut parser, &header)?;
 
     let original = header.0.map(|(line, _end)| line);
     let modified = header.1.map(|(line, _end)| line);
@@ -507,17 +518,15 @@ fn verify_hunks_in_order<T: ?Sized + ToOwned>(hunks: &[Hunk<'_, T>]) -> bool {
 
 fn hunks<'a, T: Text + ?Sized + ToOwned>(parser: &mut Parser<'a, T>) -> Result<Vec<Hunk<'a, T>>> {
     let mut hunks = Vec::new();
-    while parser.peek().is_some() {
-        let r = hunk(parser);
-
-        // TODO: Handle properly. For example there is case where hunk
-        // is partially parsed. I think we want to make it hard error
-        // instead or treating it as PS.
-        if let Ok(h) = r {
-            hunks.push(h);
-        } else {
+    while let Some((line, _)) = parser.peek() {
+        // A hunk unambiguously starts with "@@ "; any other line ends this
+        // file's hunks (e.g. the header of the next file in a multi-file
+        // patch). An error *inside* a started hunk is a hard error — silently
+        // swallowing it used to truncate patches to their leading hunks.
+        if !line.starts_with("@@ ") {
             break;
         }
+        hunks.push(hunk(parser)?);
     }
 
     if hunks.is_empty() {
@@ -1323,6 +1332,76 @@ deleted file mode 100644
         // The a/ prefix should be stripped even when /dev/null prevents " b/" split
         assert_eq!(result[0].original(), Some("deleted.txt"));
         assert_eq!(result[0].modified(), None);
+    }
+
+    #[test]
+    fn test_malformed_hunk_is_an_error_not_truncation() {
+        // A malformed hunk mid-diff must be a parse error. It used to be
+        // silently swallowed, truncating the patch to its leading hunks.
+        let s = "\
+--- a/f
++++ b/f
+@@ -1,2 +1,2 @@
+ a
+-b
++c
+@@ -10,2 +10,2 XX broken header
+ e
+-f
++g
+";
+        parse(s).unwrap_err();
+        parse_bytes(s.as_bytes()).unwrap_err();
+        parse_multiple(s).unwrap_err();
+
+        // A line count that contradicts the hunk body is also an error in
+        // strict mode (used to be swallowed the same way).
+        let s = "\
+--- a/f
++++ b/f
+@@ -1,2 +1,2 @@
+ a
+-b
++c
+@@ -10,5 +10,5 @@
+ e
+-f
++g
+";
+        assert!(matches!(
+            parse(s),
+            Err(ParsePatchError::HunkHeaderHunkMismatch)
+        ));
+
+        // str and bytes front ends agree on multi-file inputs, too.
+        assert!(parse_multiple(s).is_err());
+        assert!(super::parse_bytes_multiple(s.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn test_function_context_roundtrip() {
+        // Parsing and re-formatting a hunk with a function context must be
+        // lossless: exactly one space before the context and no stray line
+        // ending inside the header line.
+        let s = "\
+--- f
++++ f
+@@ -1,3 +1,3 @@ fn main() {
+ a
+-b
++c
+ d
+";
+        let parsed = parse(s).unwrap();
+        assert_eq!(
+            parsed.hunks()[0].function_context().map(|(ctx, _)| ctx),
+            Some("fn main() {")
+        );
+        assert_eq!(parsed.to_string(), s);
+
+        // Same through the byte-oriented writer.
+        let parsed = parse_bytes(s.as_bytes()).unwrap();
+        assert_eq!(parsed.to_bytes(), s.as_bytes());
     }
 
     #[test]

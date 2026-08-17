@@ -631,7 +631,7 @@ void Chunk_copy(Chunk *src, size_t src_start, Chunk *dst, size_t dst_start, size
  {
      if (!Chunk_bounds_check(src, src_start, n)) return;
 @@ -5,10 +12,3 @@
-
+ 
      memcpy(dst->data + dst_start, src->data + src_start, n);
  }
 -

@@ -11,12 +11,37 @@ keywords = ["diff", "patch", "merge"]
 categories = ["text-processing"]
 rust-version = "1.88"
 edition = "2024"
+exclude = ["fuzz/", ".github/"]
 
 [dependencies]
-nu-ansi-term = "0.50"
+clap = { version = "4.5", features = ["derive"], optional = true }
+memchr = "2.7"
+nu-ansi-term = { version = "0.50", optional = true }
 strsim = "0.11.1"
 thiserror = "2.0.12"
 
 [dev-dependencies]
 insta = { version = "1.43.1", features = ["glob"] }
 rstest = "0.26.1"
+
+[features]
+default = ["color"]
+## Colored patch formatting (PatchFormatter::with_color)
+color = ["dep:nu-ansi-term"]
+## Build the `flickzeug` command line tool (diff / apply / merge)
+cli = ["dep:clap", "color"]
+
+[[bin]]
+name = "flickzeug"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "compat"
+path = "tests/compat.rs"
+required-features = ["cli"]

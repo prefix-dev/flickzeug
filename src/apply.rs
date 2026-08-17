@@ -3,11 +3,23 @@ use crate::{
     patch::{Diff, Hunk, Line},
     utils::{LineIter, Text},
 };
-use std::{fmt, iter};
+use std::{borrow::Cow, fmt, iter};
 
 /// An error returned when [`apply`]ing a `Patch` fails
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ApplyError(usize, String);
+
+impl ApplyError {
+    /// The 1-based index of the hunk that could not be applied
+    pub fn hunk_index(&self) -> usize {
+        self.0
+    }
+
+    /// The formatted content of the hunk that could not be applied
+    pub fn hunk_content(&self) -> &str {
+        &self.1
+    }
+}
 
 impl fmt::Debug for ApplyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -108,51 +120,31 @@ pub struct ApplyConfig {
     pub fuzzy_config: FuzzyConfig,
 }
 
-// TODO: Add option to keep previous behaviour.
 /// Configuration of line end handling
 #[derive(Debug, Clone, Default)]
 pub enum LineEndHandling {
-    /// Replace matched line ending with line ending from patch file if they don't match.
+    /// Keep every line ending as it is in the original file (default).
     ///
-    /// This is almost like default behavior before, except that we assume uniform line ending.
-    ///
-    /// Line ending cases in pseudocode:
-    ///
-    /// ```compile_fail
-    /// match (patch_line_ending, file_line) {
-    ///     ("\n",   "\n")   => "\n"
-    ///     ("\n",   "\r\n") => "\n"
-    ///     ("\r\n", "\n")   => "\r\n"
-    ///     ("\r\n", "\r\n") => "\r\n"
-    /// }
-    /// ```
-    EnsurePatchLineEnding,
-    /// Replace matched line ending with line ending from original file if they don't match.
-    ///
-    /// Line ending cases in pseudocode:
-    ///
-    /// ```compile_fail
-    /// match (patch_line_ending, file_line) {
-    ///     ("\n",   "\n")   => "\n"
-    ///     ("\n",   "\r\n") => "\r\n"
-    ///     ("\r\n", "\n")   => "\n"
-    ///     ("\r\n", "\r\n") => "\r\n"
-    /// }
-    /// ```
+    /// Lines the patch does not touch are copied byte for byte, like GNU
+    /// patch does. Inserted lines take the line ending of the closest
+    /// retained line in the file (looking backwards first, then forwards),
+    /// so that a patch written with `\n` endings inserts `\r\n` lines into a
+    /// `\r\n` file and vice versa. An inserted line that the patch marks as
+    /// having no line ending ("\ No newline at end of file") keeps that.
     #[default]
+    KeepOriginal,
+    /// Replace every line ending with the dominant line ending of the patch.
+    ///
+    /// Note that this rewrites the endings of *all* lines in the file, even
+    /// lines no hunk touches.
+    EnsurePatchLineEnding,
+    /// Replace every line ending with the dominant line ending of the
+    /// original file.
+    ///
+    /// Note that this rewrites the endings of *all* lines in the file: a
+    /// file with mixed line endings is normalized to its most common one.
     EnsureFileLineEnding,
-    /// Enforce specific line ending.
-    ///
-    /// Line ending cases in pseudocode:
-    ///
-    /// ```compile_fail
-    /// match (patch_line_ending, file_line) {
-    ///     ("\n",   "\n")   => new_line_ending
-    ///     ("\n",   "\r\n") => new_line_ending
-    ///     ("\r\n", "\n")   => new_line_ending
-    ///     ("\r\n", "\r\n") => new_line_ending
-    /// }
-    /// ```
+    /// Enforce one specific line ending for the entire output file.
     EnsureLineEnding(LineEnd),
 }
 
@@ -165,6 +157,13 @@ pub struct FuzzyConfig {
     pub ignore_whitespace: bool,
     /// Whether to perform case-insensitive matching
     pub ignore_case: bool,
+    /// Minimum similarity (`0.0..=1.0`) a non-ignored *context* line must
+    /// have to count as matching when fuzzy matching is active. `1.0`
+    /// requires full equality (modulo `ignore_whitespace`/`ignore_case`),
+    /// which matches GNU patch behavior. *Deleted* lines always require full
+    /// (normalized) equality regardless of this setting — a patch must never
+    /// delete a line other than the one it names.
+    pub similarity_threshold: f32,
 }
 
 impl Default for FuzzyConfig {
@@ -173,47 +172,92 @@ impl Default for FuzzyConfig {
             max_fuzz: 2,
             ignore_whitespace: false,
             ignore_case: false,
+            similarity_threshold: 0.8,
         }
     }
 }
 
-// TODO: Ignore line endings in comparison
 /// Trait for types that can be compared with fuzzy matching
 pub trait FuzzyComparable {
+    /// Similarity-based equality using
+    /// [`FuzzyConfig::similarity_threshold`].
     fn fuzzy_eq(&self, other: &Self, config: &ApplyConfig) -> bool;
+
+    /// Similarity in `0.0..=1.0` (Levenshtein-based), after applying the
+    /// whitespace/case normalization configured in `config`.
     fn similarity(&self, other: &Self, config: &ApplyConfig) -> f32;
+
+    /// Full equality modulo the whitespace/case normalization configured in
+    /// `config`. Cheaper than `similarity(..) == 1.0`.
+    fn normalized_eq(&self, other: &Self, config: &ApplyConfig) -> bool {
+        self.similarity(other, config) >= 1.0
+    }
+}
+
+/// Iterator over the chars of `s` with the configured normalization applied.
+fn normalized_chars<'a>(s: &'a str, config: &'a FuzzyConfig) -> impl Iterator<Item = char> + 'a {
+    s.chars()
+        .filter(move |c| !(config.ignore_whitespace && c.is_whitespace()))
+        .flat_map(move |c| {
+            let mut lower = None;
+            let mut this = Some(c);
+            if config.ignore_case {
+                lower = Some(c.to_lowercase());
+                this = None;
+            }
+            lower.into_iter().flatten().chain(this)
+        })
+}
+
+/// The configured normalization materialized into an owned `String`, or a
+/// borrow when no normalization is enabled.
+fn normalize<'a>(s: &'a str, config: &FuzzyConfig) -> Cow<'a, str> {
+    if config.ignore_whitespace || config.ignore_case {
+        Cow::Owned(normalized_chars(s, config).collect())
+    } else {
+        Cow::Borrowed(s)
+    }
 }
 
 impl FuzzyComparable for str {
     fn fuzzy_eq(&self, other: &Self, config: &ApplyConfig) -> bool {
-        self.similarity(other, config) > 0.8
+        let fuzzy = &config.fuzzy_config;
+        if self.normalized_eq(other, config) {
+            return true;
+        }
+        let threshold = fuzzy.similarity_threshold;
+        if threshold >= 1.0 {
+            return false;
+        }
+
+        let s1 = normalize(self, fuzzy);
+        let s2 = normalize(other, fuzzy);
+        let max_len = s1.len().max(s2.len());
+        if max_len == 0 {
+            return true;
+        }
+
+        // Cheap upper bound before running O(n*m) Levenshtein: the distance
+        // is at least the difference in character counts.
+        let chars1 = s1.chars().count();
+        let chars2 = s2.chars().count();
+        let upper_bound = 1.0 - (chars1.abs_diff(chars2) as f32 / max_len as f32);
+        if upper_bound < threshold {
+            return false;
+        }
+
+        let distance = strsim::levenshtein(&s1, &s2);
+        1.0 - (distance as f32 / max_len as f32) >= threshold
     }
 
     fn similarity(&self, other: &Self, config: &ApplyConfig) -> f32 {
-        let (s1, s2) = if config.fuzzy_config.ignore_case {
-            (self.to_lowercase(), other.to_lowercase())
-        } else {
-            (self.to_string(), other.to_string())
-        };
-
-        let (s1, s2) = if config.fuzzy_config.ignore_whitespace {
-            (
-                s1.chars()
-                    .filter(|c| !c.is_whitespace())
-                    .collect::<String>(),
-                s2.chars()
-                    .filter(|c| !c.is_whitespace())
-                    .collect::<String>(),
-            )
-        } else {
-            (s1, s2)
-        };
-
-        if s1 == s2 {
+        let fuzzy = &config.fuzzy_config;
+        if self.normalized_eq(other, config) {
             return 1.0;
         }
 
-        // Use strsim's Levenshtein distance implementation
+        let s1 = normalize(self, fuzzy);
+        let s2 = normalize(other, fuzzy);
         let max_len = s1.len().max(s2.len());
         if max_len == 0 {
             return 1.0;
@@ -221,6 +265,14 @@ impl FuzzyComparable for str {
 
         let distance = strsim::levenshtein(&s1, &s2);
         1.0 - (distance as f32 / max_len as f32)
+    }
+
+    fn normalized_eq(&self, other: &Self, config: &ApplyConfig) -> bool {
+        let fuzzy = &config.fuzzy_config;
+        if !fuzzy.ignore_whitespace && !fuzzy.ignore_case {
+            return self == other;
+        }
+        normalized_chars(self, fuzzy).eq(normalized_chars(other, fuzzy))
     }
 }
 
@@ -242,6 +294,14 @@ impl FuzzyComparable for [u8] {
         } else {
             // Fall back to exact byte comparison
             if self == other { 1.0 } else { 0.0 }
+        }
+    }
+
+    fn normalized_eq(&self, other: &Self, config: &ApplyConfig) -> bool {
+        if let (Ok(s1), Ok(s2)) = (std::str::from_utf8(self), std::str::from_utf8(other)) {
+            s1.normalized_eq(s2, config)
+        } else {
+            self == other
         }
     }
 }
@@ -281,21 +341,6 @@ impl<T: ?Sized> Clone for ImageLine<'_, T> {
     }
 }
 
-fn map_line_ending<T>(line_end: Option<LineEnd>, ensure_line_end: Option<LineEnd>) -> T
-where
-    T: From<LineEnd> + Default,
-{
-    let Some(line_end) = line_end else {
-        return Default::default();
-    };
-
-    if let Some(ensure_line_end) = ensure_line_end {
-        ensure_line_end.into()
-    } else {
-        line_end.into()
-    }
-}
-
 /// Apply a `Diff` to a base image with default fuzzy matching
 pub fn apply(base_image: &str, diff: &Diff<'_, str>) -> ApplyResult<String, ApplyError> {
     apply_with_config(base_image, diff, &ApplyConfig::default())
@@ -307,22 +352,81 @@ pub fn apply_with_config(
     diff: &Diff<'_, str>,
     config: &ApplyConfig,
 ) -> ApplyResult<String, ApplyError> {
+    let (lines, stats) = apply_all(base_image, diff, config)?;
+
+    let mut content = String::with_capacity(base_image.len());
+    for (line, ending) in lines {
+        content.push_str(line);
+        if let Some(ending) = ending {
+            let e: &str = ending.into();
+            content.push_str(e);
+        }
+    }
+
+    Ok((content, stats))
+}
+
+/// Apply a non-utf8 `Diff` to a base image with default fuzzy matching
+pub fn apply_bytes(base_image: &[u8], patch: &Diff<'_, [u8]>) -> ApplyResult<Vec<u8>, ApplyError> {
+    apply_bytes_with_config(base_image, patch, &ApplyConfig::default())
+}
+
+/// Apply a non-utf8 `Diff` to a base image with custom fuzzy matching configuration
+pub fn apply_bytes_with_config(
+    base_image: &[u8],
+    diff: &Diff<'_, [u8]>,
+    config: &ApplyConfig,
+) -> ApplyResult<Vec<u8>, ApplyError> {
+    let (lines, stats) = apply_all(base_image, diff, config)?;
+
+    let mut content = Vec::with_capacity(base_image.len());
+    for (line, ending) in lines {
+        content.extend_from_slice(line);
+        if let Some(ending) = ending {
+            let e: &[u8] = ending.into();
+            content.extend_from_slice(e);
+        }
+    }
+
+    Ok((content, stats))
+}
+
+/// A patched file as resolved output lines: the line's content and the line
+/// ending it should be written with.
+type OutputLines<'a, T> = Vec<(&'a T, Option<LineEnd>)>;
+
+/// The shared application core: patches the image hunk by hunk and resolves
+/// the line ending of every output line according to the configured
+/// [`LineEndHandling`].
+fn apply_all<'a, T>(
+    base_image: &'a T,
+    diff: &'a Diff<'a, T>,
+    config: &ApplyConfig,
+) -> Result<(OutputLines<'a, T>, ApplyStats), ApplyError>
+where
+    T: PartialEq + FuzzyComparable + ?Sized + Text + ToOwned,
+    Hunk<'a, T>: fmt::Display,
+{
     let mut image: Vec<_> = LineIter::new(base_image)
         .map(ImageLine::Unpatched)
         .collect();
 
+    let file_line_ending = if image.is_empty() {
+        None
+    } else {
+        Some(LineEnd::most_common(base_image))
+    };
+
     let mut stats = ApplyStats::new();
 
     for (i, hunk) in diff.hunks().iter().enumerate() {
-        let hunk_stats = match apply_hunk_with_config(&mut image, hunk, config) {
-            Ok(stats) => stats,
-            Err(_) => return Err(ApplyError(i + 1, format!("{}", hunk))),
-        };
+        let hunk_stats = apply_hunk_with_config(&mut image, hunk, config, file_line_ending)
+            .map_err(|()| ApplyError(i + 1, format!("{}", hunk)))?;
         stats.add_hunk(hunk_stats);
     }
 
-    // TODO: Keep line ending as is like it was before.
-    let preferred_line_ending = Some(match config.line_end_strategy {
+    let preferred_line_ending = match config.line_end_strategy {
+        LineEndHandling::KeepOriginal => None,
         LineEndHandling::EnsurePatchLineEnding => {
             let mut lf_score = 0usize;
             let mut crlf_score = 0usize;
@@ -337,30 +441,27 @@ pub fn apply_with_config(
                 }
             }
 
-            LineEnd::choose_from_scores(lf_score, crlf_score)
+            Some(LineEnd::choose_from_scores(lf_score, crlf_score))
         }
-        LineEndHandling::EnsureFileLineEnding => LineEnd::most_common(base_image),
-        LineEndHandling::EnsureLineEnding(line_end) => line_end,
-    });
+        LineEndHandling::EnsureFileLineEnding => Some(LineEnd::most_common(base_image)),
+        LineEndHandling::EnsureLineEnding(line_end) => Some(line_end),
+    };
 
-    let content = image
+    let lines = image
         .into_iter()
         .map(ImageLine::into_inner)
         .map(|(line, ending)| {
-            format!(
-                "{}{}",
-                line,
-                map_line_ending::<&str>(ending, preferred_line_ending)
-            )
+            let ending = match (preferred_line_ending, ending) {
+                // A missing final newline is always preserved
+                (_, None) => None,
+                (Some(preferred), Some(_)) => Some(preferred),
+                (None, ending) => ending,
+            };
+            (line, ending)
         })
         .collect();
 
-    Ok((content, stats))
-}
-
-/// Apply a non-utf8 `Diff` to a base image with default fuzzy matching
-pub fn apply_bytes(base_image: &[u8], patch: &Diff<'_, [u8]>) -> ApplyResult<Vec<u8>, ApplyError> {
-    apply_bytes_with_config(base_image, patch, &ApplyConfig::default())
+    Ok((lines, stats))
 }
 
 /// Returns `true` if `diff` already appears to be applied to `base_image`,
@@ -417,12 +518,28 @@ pub fn is_diff_applied_with_config(
     diff: &Diff<'_, [u8]>,
     config: &ApplyConfig,
 ) -> bool {
+    is_diff_applied_generic(base_image, diff, config)
+}
+
+/// The `str` twin of [`is_diff_applied_with_config`].
+pub fn is_diff_applied_str_with_config(
+    base_image: &str,
+    diff: &Diff<'_, str>,
+    config: &ApplyConfig,
+) -> bool {
+    is_diff_applied_generic(base_image, diff, config)
+}
+
+fn is_diff_applied_generic<T>(base_image: &T, diff: &Diff<'_, T>, config: &ApplyConfig) -> bool
+where
+    T: FuzzyComparable + ?Sized + Text + ToOwned,
+{
     let hunks = diff.hunks();
     if hunks.is_empty() {
         return false;
     }
 
-    let image: Vec<(&[u8], Option<LineEnd>)> = LineIter::new(base_image).collect();
+    let image: Vec<(&T, Option<LineEnd>)> = LineIter::new(base_image).collect();
 
     hunks
         .iter()
@@ -434,11 +551,14 @@ pub fn is_diff_applied_with_config(
 /// inserting, whose post-image is only context lines that the unpatched
 /// content contains as well — its pre-image (context plus deleted lines)
 /// does *not* occur, i.e. the deleted lines are actually gone.
-fn is_hunk_applied(
-    image: &[(&[u8], Option<LineEnd>)],
-    hunk: &Hunk<'_, [u8]>,
+fn is_hunk_applied<T>(
+    image: &[(&T, Option<LineEnd>)],
+    hunk: &Hunk<'_, T>,
     config: &ApplyConfig,
-) -> bool {
+) -> bool
+where
+    T: FuzzyComparable + ?Sized + Text + ToOwned,
+{
     let post_image_lines: Vec<_> = post_image(hunk.lines()).collect();
     if post_image_lines.is_empty() {
         return false;
@@ -466,22 +586,29 @@ fn is_hunk_applied(
 /// lines strictly (equality modulo the whitespace/case normalization from
 /// `config`, without any similarity threshold). Returns `None` if `lines` is
 /// empty.
-fn find_lines_position(
-    image: &[(&[u8], Option<LineEnd>)],
-    lines: &[(&[u8], Option<LineEnd>)],
+fn find_lines_position<T>(
+    image: &[(&T, Option<LineEnd>)],
+    lines: &[(&T, Option<LineEnd>)],
     start_hint: usize,
     config: &ApplyConfig,
-) -> Option<usize> {
+) -> Option<usize>
+where
+    T: FuzzyComparable + ?Sized + Text + ToOwned,
+{
     if lines.is_empty() {
         return None;
     }
 
     let match_at = |pos: usize| -> bool {
         image.get(pos..pos + lines.len()).is_some_and(|window| {
-            lines
-                .iter()
-                .zip(window)
-                .all(|(line, image_line)| line.0.similarity(image_line.0, config) >= 1.0)
+            lines.iter().zip(window).all(|(line, image_line)| {
+                // Whether a line ending exists is semantic (the "\ No newline
+                // at end of file" marker): a diff that only adds or removes
+                // the trailing newline must not count as already applied.
+                // Which ending it is (LF vs CRLF) is convention and ignored.
+                line.1.is_some() == image_line.1.is_some()
+                    && line.0.normalized_eq(image_line.0, config)
+            })
         })
     };
 
@@ -496,23 +623,24 @@ fn find_lines_position(
         .find(|&pos| match_at(pos))
 }
 
-/// The outcome of attempting to apply a diff with [`apply_bytes_reporting`].
+/// The outcome of attempting to apply a diff with [`apply_bytes_reporting`]
+/// or [`apply_reporting`].
 ///
 /// This distinguishes the three cases a caller usually cares about: the diff
 /// was applied and changed the content, the diff appears to be already applied
 /// (so applying it would be a no-op), or the diff does not apply and is not
 /// already applied.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ApplyOutcome {
+pub enum ApplyOutcome<T = Vec<u8>> {
     /// The diff was applied and modified the base image. Contains the patched
     /// image together with the [`ApplyStats`] from the application.
-    Applied(Vec<u8>, ApplyStats),
+    Applied(T, ApplyStats),
     /// The diff appears to be already applied: `base_image` already reflects the
     /// modified side of the diff. Contains the (unchanged) base image.
     ///
     /// This is detected robustly even under fuzzy matching, where a forward
     /// apply of an already-applied diff succeeds as a no-op.
-    AlreadyApplied(Vec<u8>),
+    AlreadyApplied(T),
     /// The diff could not be applied and is not already applied. Contains the
     /// [`ApplyError`] from the failed forward application.
     Failed(ApplyError),
@@ -575,67 +703,27 @@ pub fn apply_bytes_reporting(
     }
 }
 
-/// Apply a non-utf8 `Diff` to a base image with custom fuzzy matching configuration
-pub fn apply_bytes_with_config(
-    base_image: &[u8],
-    diff: &Diff<'_, [u8]>,
+/// The `str` twin of [`apply_bytes_reporting`].
+pub fn apply_reporting(
+    base_image: &str,
+    diff: &Diff<'_, str>,
     config: &ApplyConfig,
-) -> ApplyResult<Vec<u8>, ApplyError> {
-    let mut image: Vec<_> = LineIter::new(base_image)
-        .map(ImageLine::Unpatched)
-        .collect();
-
-    let mut stats = ApplyStats::new();
-
-    for (i, hunk) in diff.hunks().iter().enumerate() {
-        let hunk_stats = match apply_hunk_with_config(&mut image, hunk, config) {
-            Ok(stats) => stats,
-            Err(_) => return Err(ApplyError(i + 1, format!("{}", hunk))),
-        };
-        stats.add_hunk(hunk_stats);
+) -> ApplyOutcome<String> {
+    if is_diff_applied_str_with_config(base_image, diff, config) {
+        return ApplyOutcome::AlreadyApplied(base_image.to_owned());
     }
 
-    // TODO: Keep line ending as is like it was before.
-    let preferred_line_ending = Some(match config.line_end_strategy {
-        LineEndHandling::EnsurePatchLineEnding => {
-            let mut lf_score = 0usize;
-            let mut crlf_score = 0usize;
-
-            for hunk in diff.hunks().iter() {
-                for line in hunk.lines() {
-                    match line.line_end() {
-                        Some(LineEnd::Lf) => lf_score += 1,
-                        Some(LineEnd::CrLf) => crlf_score += 1,
-                        _ => (),
-                    }
-                }
-            }
-
-            LineEnd::choose_from_scores(lf_score, crlf_score)
-        }
-        LineEndHandling::EnsureFileLineEnding => LineEnd::most_common(base_image),
-        LineEndHandling::EnsureLineEnding(line_end) => line_end,
-    });
-
-    let content = image
-        .into_iter()
-        .map(ImageLine::into_inner)
-        .flat_map(|(line, ending)| {
-            [
-                line,
-                map_line_ending::<&[u8]>(ending, preferred_line_ending),
-            ]
-            .concat()
-        })
-        .collect();
-
-    Ok((content, stats))
+    match apply_with_config(base_image, diff, config) {
+        Ok((patched, stats)) => ApplyOutcome::Applied(patched, stats),
+        Err(err) => ApplyOutcome::Failed(err),
+    }
 }
 
 fn apply_hunk_with_config<'a, T>(
     image: &mut Vec<ImageLine<'a, T>>,
     hunk: &Hunk<'a, T>,
     config: &ApplyConfig,
+    file_line_ending: Option<LineEnd>,
 ) -> Result<HunkStats, ()>
 where
     T: PartialEq + FuzzyComparable + ?Sized + Text + ToOwned,
@@ -656,16 +744,27 @@ where
         }
     }
 
+    let keep_original = matches!(config.line_end_strategy, LineEndHandling::KeepOriginal);
+
     // update image
-    if fuzz_level == 0 {
+    if fuzz_level == 0 && !keep_original {
         // Exact match - replace all lines as before
         image.splice(
             pos..pos + pre_image_line_count(hunk.lines()),
             post_image(hunk.lines()).map(ImageLine::Patched),
         );
     } else {
-        // Fuzzy match - preserve original context lines, only apply insertions/deletions
-        apply_hunk_preserving_context(image, hunk, pos);
+        // Only remap the endings of inserted lines when the patch's endings
+        // demonstrably disagree with the file's at the match site (an LF
+        // patch applied to a CRLF file, or vice versa). When they agree, the
+        // patch's inserted endings are authoritative — this keeps
+        // apply(a, create_patch(a, b)) == b exact even for files that mix
+        // line endings.
+        let inherit_insert_endings = keep_original && !patch_endings_match_file(image, hunk, pos);
+
+        // Preserve original context lines (and, with KeepOriginal, their
+        // line endings), only apply insertions/deletions
+        apply_hunk_preserving_context(image, hunk, pos, inherit_insert_endings, file_line_ending);
     }
 
     Ok(HunkStats {
@@ -675,11 +774,46 @@ where
     })
 }
 
-/// Apply hunk while preserving original context lines (for fuzzy matching)
+/// Returns `true` when every context/deleted line of `hunk` that has a line
+/// ending in the patch agrees with the ending of the image line it matched.
+/// When they all agree the patch was written with the file's line-ending
+/// convention and its inserted endings can be trusted verbatim.
+fn patch_endings_match_file<T>(image: &[ImageLine<T>], hunk: &Hunk<'_, T>, pos: usize) -> bool
+where
+    T: ?Sized + Text + ToOwned,
+{
+    let mut offset = 0;
+    for line in hunk.lines() {
+        match *line {
+            Line::Context((_, end)) | Line::Delete((_, end)) => {
+                if let Some(image_line) = image.get(pos + offset) {
+                    let image_end = image_line.inner().1;
+                    if end.is_some() && image_end.is_some() && end != image_end {
+                        return false;
+                    }
+                }
+                offset += 1;
+            }
+            Line::Insert(_) => {}
+        }
+    }
+    true
+}
+
+/// Apply hunk while preserving original context lines.
+///
+/// When `inherit_insert_endings` is set (the [`LineEndHandling::KeepOriginal`]
+/// strategy), inserted lines take the ending of the closest retained line —
+/// looking backwards first, then forwards — falling back to the file's
+/// dominant ending, so a `\n` patch inserts `\r\n` lines into a `\r\n` file.
+/// An inserted line the patch marks as having no ending keeps that (it is the
+/// "\ No newline at end of file" case).
 fn apply_hunk_preserving_context<'a, T>(
     image: &mut Vec<ImageLine<'a, T>>,
     hunk: &Hunk<'a, T>,
     pos: usize,
+    inherit_insert_endings: bool,
+    file_line_ending: Option<LineEnd>,
 ) where
     T: ?Sized + Text + ToOwned,
 {
@@ -698,9 +832,18 @@ fn apply_hunk_preserving_context<'a, T>(
                 // Remove the line
                 image.remove(pos + image_offset);
             }
-            Line::Insert(line) => {
-                // Insert the new line
-                image.insert(pos + image_offset, ImageLine::Patched(line));
+            Line::Insert((text, ending)) => {
+                let ending = if inherit_insert_endings && ending.is_some() {
+                    let previous = (pos + image_offset)
+                        .checked_sub(1)
+                        .and_then(|i| image.get(i))
+                        .and_then(|l| l.inner().1);
+                    let next = image.get(pos + image_offset).and_then(|l| l.inner().1);
+                    previous.or(next).or(file_line_ending).or(ending)
+                } else {
+                    ending
+                };
+                image.insert(pos + image_offset, ImageLine::Patched((text, ending)));
                 image_offset += 1;
             }
         }
@@ -721,9 +864,12 @@ where
         return Some((pos, 0));
     }
 
+    // Precompute everything that is per-hunk rather than per-position once
+    let matcher = HunkMatcher::new(hunk);
+
     // Try fuzzy matching with increasing fuzz levels
     for fuzz_level in 1..=config.fuzzy_config.max_fuzz {
-        if let Some(pos) = find_position_with_fuzz(image, hunk, fuzz_level, config) {
+        if let Some(pos) = matcher.find_position(image, hunk, fuzz_level, config) {
             return Some((pos, fuzz_level));
         }
     }
@@ -731,188 +877,167 @@ where
     None
 }
 
-/// Find position with specified fuzz level
-fn find_position_with_fuzz<T>(
-    image: &[ImageLine<T>],
-    hunk: &Hunk<'_, T>,
-    fuzz_level: usize,
-    config: &ApplyConfig,
-) -> Option<usize>
+/// Per-hunk matching data, computed once per hunk instead of once per
+/// candidate position (the position search is O(file length)).
+struct HunkMatcher<'a, T: ?Sized> {
+    /// The hunk's pre-image: its context and deleted lines, in order
+    pre_image: Vec<(&'a T, Option<LineEnd>)>,
+    /// Parallel to `pre_image`: whether the line is a deletion
+    is_delete: Vec<bool>,
+    /// Indices into `pre_image` that are context lines
+    context_indices: Vec<usize>,
+}
+
+impl<'a, T> HunkMatcher<'a, T>
 where
     T: PartialEq + FuzzyComparable + ?Sized + Text + ToOwned,
 {
-    let pos = std::cmp::min(hunk.new_range().start().saturating_sub(1), image.len());
+    fn new(hunk: &Hunk<'a, T>) -> Self {
+        let mut pre_image = Vec::new();
+        let mut is_delete = Vec::new();
+        let mut context_indices = Vec::new();
 
-    let backward = (0..pos).rev();
-    let forward = pos + 1..image.len();
-
-    iter::once(pos)
-        .chain(interleave(backward, forward))
-        .find(|&pos| match_fragment_fuzzy(image, hunk.lines(), pos, fuzz_level, config))
-}
-
-/// Match fragment with fuzzy context matching
-fn match_fragment_fuzzy<T>(
-    image: &[ImageLine<T>],
-    lines: &[Line<'_, T>],
-    pos: usize,
-    fuzz_level: usize,
-    config: &ApplyConfig,
-) -> bool
-where
-    T: PartialEq + FuzzyComparable + ?Sized + Text,
-{
-    let len = pre_image_line_count(lines);
-
-    let image_slice = if let Some(image) = image.get(pos..pos + len) {
-        image
-    } else {
-        return false;
-    };
-
-    // If any of these lines have already been patched then we can't match at this position
-    if image_slice.iter().any(ImageLine::is_patched) {
-        return false;
-    }
-
-    let pre_image_lines: Vec<_> = pre_image(lines).collect();
-    let image_lines: Vec<_> = image_slice.iter().map(ImageLine::inner).collect();
-
-    if pre_image_lines.len() != image_lines.len() {
-        return false;
-    }
-
-    // Get context line indices from the original lines
-    let context_indices: Vec<_> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(i, line)| match line {
-            Line::Context(_) => Some(i),
-            _ => None,
-        })
-        .collect();
-
-    // Map context indices to pre_image indices
-    let mut pre_image_context_indices = Vec::new();
-    let mut pre_image_idx = 0;
-    for (original_idx, line) in lines.iter().enumerate() {
-        match line {
-            Line::Context(_) | Line::Delete(_) => {
-                if context_indices.contains(&original_idx) {
-                    pre_image_context_indices.push(pre_image_idx);
+        for line in hunk.lines() {
+            match *line {
+                Line::Context(l) => {
+                    context_indices.push(pre_image.len());
+                    pre_image.push(l);
+                    is_delete.push(false);
                 }
-                pre_image_idx += 1;
+                Line::Delete(l) => {
+                    pre_image.push(l);
+                    is_delete.push(true);
+                }
+                Line::Insert(_) => {}
             }
-            Line::Insert(_) => {}
+        }
+
+        Self {
+            pre_image,
+            is_delete,
+            context_indices,
         }
     }
 
-    // NOTE: Temporary (?) fix mostly for line endings.
-    // If we don't have enough context lines to fuzz, fall back to exact matching, but still check for string similarity.
-    if pre_image_context_indices.len() < fuzz_level {
-        let len = pre_image_line_count(lines);
+    fn find_position(
+        &self,
+        image: &[ImageLine<T>],
+        hunk: &Hunk<'_, T>,
+        fuzz_level: usize,
+        config: &ApplyConfig,
+    ) -> Option<usize> {
+        let combinations = self.fuzz_combinations(fuzz_level);
 
-        let image = if let Some(image) = image.get(pos..pos + len) {
-            image
-        } else {
+        let pos = std::cmp::min(hunk.new_range().start().saturating_sub(1), image.len());
+        let backward = (0..pos).rev();
+        let forward = pos + 1..image.len();
+
+        iter::once(pos)
+            .chain(interleave(backward, forward))
+            .find(|&pos| self.matches_at(image, pos, &combinations, fuzz_level, config))
+    }
+
+    /// Generate the combinations of context line indices to ignore that are
+    /// *new* at `fuzz_level`, using GNU patch-style edge fuzz: fuzz N may
+    /// ignore up to N context lines from the start and up to N from the end.
+    /// Combinations already tried at lower levels are not repeated; the empty
+    /// combination is tried at level 1 because level 0 uses strict equality
+    /// while the fuzzy path compares with the configured normalization and
+    /// similarity threshold.
+    fn fuzz_combinations(&self, fuzz_level: usize) -> Vec<Vec<usize>> {
+        let indices = &self.context_indices;
+        if fuzz_level == 0 || indices.is_empty() {
+            return vec![vec![]];
+        }
+
+        let len = indices.len();
+        let mut combinations = Vec::new();
+
+        if fuzz_level == 1 {
+            combinations.push(Vec::new());
+        }
+
+        for start_ignore in 0..=fuzz_level.min(len) {
+            for end_ignore in 0..=fuzz_level.min(len.saturating_sub(start_ignore)) {
+                // Only combinations where at least one side reaches the
+                // current level are new; the rest were tried at lower levels.
+                if start_ignore.max(end_ignore) != fuzz_level {
+                    continue;
+                }
+
+                let mut ignored = Vec::new();
+                ignored.extend(indices.iter().take(start_ignore).copied());
+                ignored.extend(
+                    indices
+                        .iter()
+                        .skip(start_ignore)
+                        .rev()
+                        .take(end_ignore)
+                        .copied(),
+                );
+
+                combinations.push(ignored);
+            }
+        }
+
+        combinations
+    }
+
+    fn matches_at(
+        &self,
+        image: &[ImageLine<T>],
+        pos: usize,
+        combinations: &[Vec<usize>],
+        fuzz_level: usize,
+        config: &ApplyConfig,
+    ) -> bool {
+        let Some(window) = image.get(pos..pos + self.pre_image.len()) else {
             return false;
         };
 
-        // If any of these lines have already been patched then we can't match at this position
-        if image.iter().any(ImageLine::is_patched) {
+        // If any of these lines have already been patched then we can't match
+        // at this position
+        if window.iter().any(ImageLine::is_patched) {
             return false;
         }
 
-        for (pre_line, image_line) in pre_image_lines.iter().zip(image_lines.iter()) {
-            if !pre_line.0.fuzzy_eq(image_line.0, config) {
-                return false;
-            }
+        // Not enough context lines to perform edge fuzz at this level: fall
+        // back to comparing the whole window without ignoring any lines.
+        if self.context_indices.len() < fuzz_level {
+            return self.window_matches(window, &[], config);
         }
 
-        return true;
+        combinations
+            .iter()
+            .any(|ignored| self.window_matches(window, ignored, config))
     }
 
-    // Try different combinations of ignoring context lines
-    let combinations = generate_fuzz_combinations(&pre_image_context_indices, fuzz_level);
-
-    for ignored_indices in combinations {
-        if match_with_ignored_context(
-            pre_image_lines.as_slice(),
-            &image_lines,
-            &ignored_indices,
-            config,
-        ) {
-            return true;
-        }
+    /// Compare the hunk's pre-image against an image window, skipping the
+    /// `ignored` context indices. Context lines match with the configured
+    /// similarity threshold; deleted lines always require full (normalized)
+    /// equality — a patch must never delete a line other than the one it
+    /// names.
+    fn window_matches(
+        &self,
+        window: &[ImageLine<T>],
+        ignored: &[usize],
+        config: &ApplyConfig,
+    ) -> bool {
+        self.pre_image
+            .iter()
+            .zip(window.iter().map(ImageLine::inner))
+            .enumerate()
+            .all(|(i, (pre_line, image_line))| {
+                if ignored.contains(&i) {
+                    return true;
+                }
+                if self.is_delete[i] {
+                    pre_line.0.normalized_eq(image_line.0, config)
+                } else {
+                    pre_line.0.fuzzy_eq(image_line.0, config)
+                }
+            })
     }
-
-    false
-}
-
-/// Generate combinations of context line indices to ignore using GNU patch-style edge fuzz.
-///
-/// GNU patch's fuzz behavior:
-/// - fuzz 0: all context lines must match
-/// - fuzz 1: can ignore up to 1 line from start AND up to 1 line from end
-/// - fuzz 2: can ignore up to 2 lines from start AND up to 2 lines from end
-///
-/// This generates all combinations of ignoring 0..=fuzz_level lines from the start
-/// and 0..=fuzz_level lines from the end.
-fn generate_fuzz_combinations(context_indices: &[usize], fuzz_level: usize) -> Vec<Vec<usize>> {
-    if fuzz_level == 0 || context_indices.is_empty() {
-        return vec![vec![]];
-    }
-
-    let len = context_indices.len();
-    let mut combinations = Vec::new();
-
-    // Try all combinations of ignoring start_ignore lines from start
-    // and end_ignore lines from end
-    for start_ignore in 0..=fuzz_level.min(len) {
-        for end_ignore in 0..=fuzz_level.min(len.saturating_sub(start_ignore)) {
-            let mut ignored = Vec::new();
-
-            // Add indices to ignore from the start
-            ignored.extend(context_indices.iter().take(start_ignore).copied());
-
-            // Add indices to ignore from the end (avoiding overlap with start)
-            ignored.extend(
-                context_indices
-                    .iter()
-                    .skip(start_ignore)
-                    .rev()
-                    .take(end_ignore)
-                    .copied(),
-            );
-
-            combinations.push(ignored);
-        }
-    }
-
-    combinations
-}
-
-/// Match lines while ignoring specified context line indices
-fn match_with_ignored_context<T>(
-    pre_image_lines: &[(&T, Option<LineEnd>)],
-    image_lines: &[(&T, Option<LineEnd>)],
-    ignored_indices: &[usize],
-    config: &ApplyConfig,
-) -> bool
-where
-    T: PartialEq + FuzzyComparable + ?Sized,
-{
-    for (i, (pre_line, image_line)) in pre_image_lines.iter().zip(image_lines.iter()).enumerate() {
-        if ignored_indices.contains(&i) {
-            continue; // Skip this context line
-        }
-
-        // Require high similarity for non-ignored lines
-        if !pre_line.0.fuzzy_eq(image_line.0, config) {
-            return false;
-        }
-    }
-    true
 }
 
 // Search in `image` for a place to apply hunk.
@@ -979,7 +1104,11 @@ fn match_fragment<T: PartialEq + ?Sized + Text>(
         return false;
     }
 
-    pre_image(lines).eq(image.iter().map(ImageLine::inner))
+    // Compare content only: a difference that is purely in the line endings
+    // (LF patch against a CRLF file and vice versa) must not prevent a match.
+    pre_image(lines)
+        .map(|(line, _end)| line)
+        .eq(image.iter().map(|line| line.inner().0))
 }
 
 #[derive(Debug)]
@@ -1032,8 +1161,8 @@ mod test {
     use std::path::PathBuf;
 
     use crate::{
-        ApplyConfig, ApplyOutcome, Diff, FuzzyConfig, apply, apply_bytes_reporting,
-        is_diff_applied_with_config,
+        ApplyConfig, ApplyOutcome, Diff, FuzzyConfig, LineEndHandling, apply,
+        apply_bytes_reporting, apply_reporting, is_diff_applied_with_config,
     };
 
     fn load_files(name: &str) -> (String, String) {
@@ -1197,6 +1326,141 @@ mod test {
     }
 
     #[test]
+    fn keep_original_preserves_untouched_line_endings() {
+        // A file with mixed line endings: only the patched line may change.
+        // The default strategy used to normalize every line to the file's
+        // most common ending.
+        let base = "keep\r\nold\r\nplain\nmore\r\n";
+        let patch = "\
+--- a
++++ b
+@@ -2 +2 @@
+-old
++new
+";
+        let diff = Diff::from_str(patch).unwrap();
+        let (out, _) = apply(base, &diff).unwrap();
+        // 'plain' keeps its LF; the inserted line inherits CRLF from its
+        // neighborhood even though the patch uses LF.
+        assert_eq!(out, "keep\r\nnew\r\nplain\nmore\r\n");
+    }
+
+    #[test]
+    fn keep_original_inserted_lines_inherit_neighbor_ending() {
+        let base = "one\r\ntwo\r\nthree\r\n";
+        let patch = "\
+--- a
++++ b
+@@ -1,3 +1,4 @@
+ one
+ two
++two and a half
+ three
+";
+        let diff = Diff::from_str(patch).unwrap();
+        let (out, _) = apply(base, &diff).unwrap();
+        assert_eq!(out, "one\r\ntwo\r\ntwo and a half\r\nthree\r\n");
+    }
+
+    #[test]
+    fn keep_original_preserves_missing_final_newline() {
+        // The inserted final line is marked "no newline" in the patch and
+        // must stay that way even though its neighbors have endings.
+        let base = "a\nb\n";
+        let patch = "\
+--- a
++++ b
+@@ -1,2 +1,3 @@
+ a
+ b
++no newline here
+\\ No newline at end of file
+";
+        let diff = Diff::from_str(patch).unwrap();
+        let (out, _) = apply(base, &diff).unwrap();
+        assert_eq!(out, "a\nb\nno newline here");
+    }
+
+    #[test]
+    fn ensure_file_line_ending_still_normalizes() {
+        // The old default remains available as an explicit opt-in.
+        let base = "keep\r\nold\r\nplain\nmore\r\n";
+        let patch = "\
+--- a
++++ b
+@@ -2 +2 @@
+-old
++new
+";
+        let diff = Diff::from_str(patch).unwrap();
+        let config = ApplyConfig {
+            line_end_strategy: LineEndHandling::EnsureFileLineEnding,
+            ..ApplyConfig::default()
+        };
+        let (out, _) = crate::apply_with_config(base, &diff, &config).unwrap();
+        assert_eq!(out, "keep\r\nnew\r\nplain\r\nmore\r\n");
+    }
+
+    #[test]
+    fn delete_lines_require_exact_match() {
+        // The deleted line in the patch is only similar (not equal) to the
+        // line in the file. Context matches exactly. GNU patch rejects this;
+        // similarity-based matching used to delete the wrong line.
+        let base = "context 1\nthe quick brown fox jumps\ncontext 2\n";
+        let patch = "\
+--- a
++++ b
+@@ -1,3 +1,2 @@
+ context 1
+-the quick brown fox jumped
+ context 2
+";
+        let diff = Diff::from_str(patch).unwrap();
+        assert!(apply(base, &diff).is_err());
+    }
+
+    #[test]
+    fn similarity_threshold_is_configurable() {
+        // One context line differs slightly; with fuzz the hunk applies when
+        // the threshold tolerates the difference and fails when set to 1.0.
+        let base = "int main(void) {\nreturn 0;\n}\n";
+        let patch = "\
+--- a
++++ b
+@@ -1,3 +1,4 @@
+ int main(void)  {
+ return 0;
++// done
+ }
+";
+        let diff = Diff::from_str(patch).unwrap();
+
+        let lenient = ApplyConfig::default();
+        assert!(crate::apply_with_config(base, &diff, &lenient).is_ok());
+
+        let strict = ApplyConfig {
+            fuzzy_config: FuzzyConfig {
+                similarity_threshold: 1.0,
+                ..FuzzyConfig::default()
+            },
+            ..ApplyConfig::default()
+        };
+        // With threshold 1.0 the mismatching context line can still be
+        // ignored by edge fuzz, so this applies; disallow fuzz too and it
+        // must fail.
+        let exact = ApplyConfig {
+            fuzzy_config: FuzzyConfig {
+                similarity_threshold: 1.0,
+                max_fuzz: 0,
+                ..FuzzyConfig::default()
+            },
+            ..ApplyConfig::default()
+        };
+        assert!(crate::apply_with_config(base, &diff, &strict).is_ok());
+        assert!(crate::apply_with_config(base, &diff, &exact).is_err());
+    }
+
+    #[test]
     fn test_error_message_format() {
         // Test that error messages show the hunk in a readable format
         let base = "completely different content\n";
@@ -1215,6 +1479,8 @@ mod test {
         assert!(result.is_err());
 
         let err = result.unwrap_err();
+        assert_eq!(err.hunk_index(), 1);
+        assert!(err.hunk_content().contains("line 2 modified"));
         let err_msg = err.to_string();
 
         // Snapshot test the error message format
@@ -1265,6 +1531,7 @@ mod test {
                 max_fuzz: 2,
                 ignore_whitespace: true,
                 ignore_case: false,
+                ..FuzzyConfig::default()
             },
             ..Default::default()
         }
@@ -1614,6 +1881,74 @@ endif()
 
         // Unrelated content: cannot apply and is not already applied.
         match apply_bytes_reporting(b"totally different\n", &diff, &config) {
+            ApplyOutcome::Failed(_) => {}
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trailing_newline_only_diff_is_not_already_applied() {
+        // Found by the GNU compat suite: a diff whose only change is adding
+        // the trailing newline was judged already-applied (content-only
+        // post-image matching) and skipped.
+        let patch = "\
+--- a/f
++++ b/f
+@@ -1,3 +1,3 @@
+ alpha
+ beta
+-gamma
+\\ No newline at end of file
++gamma
+";
+        let diff = Diff::from_bytes(patch.as_bytes()).unwrap();
+        let config = fuzzy_config();
+
+        let pre = b"alpha\nbeta\ngamma";
+        let post = b"alpha\nbeta\ngamma\n";
+
+        assert!(!is_diff_applied_with_config(pre, &diff, &config));
+        assert!(is_diff_applied_with_config(post, &diff, &config));
+
+        match apply_bytes_reporting(pre, &diff, &config) {
+            ApplyOutcome::Applied(content, _) => assert_eq!(content, post),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        match apply_bytes_reporting(post, &diff, &config) {
+            ApplyOutcome::AlreadyApplied(content) => assert_eq!(content, post),
+            other => panic!("expected AlreadyApplied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_apply_reporting_str() {
+        // The str twin behaves like the bytes version.
+        let patch = "\
+--- a/version
++++ b/version
+@@ -1,3 +1,3 @@
+ line 1
+-3.1
++3.12
+ line 3
+";
+        let diff = Diff::from_str(patch).unwrap();
+        let config = fuzzy_config();
+
+        match apply_reporting("line 1\n3.1\nline 3\n", &diff, &config) {
+            ApplyOutcome::Applied(content, stats) => {
+                assert_eq!(content, "line 1\n3.12\nline 3\n");
+                assert!(stats.has_changes());
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        match apply_reporting("line 1\n3.12\nline 3\n", &diff, &config) {
+            ApplyOutcome::AlreadyApplied(content) => {
+                assert_eq!(content, "line 1\n3.12\nline 3\n")
+            }
+            other => panic!("expected AlreadyApplied, got {other:?}"),
+        }
+        match apply_reporting("unrelated\n", &diff, &config) {
             ApplyOutcome::Failed(_) => {}
             other => panic!("expected Failed, got {other:?}"),
         }
