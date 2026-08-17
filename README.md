@@ -67,8 +67,8 @@ assert_eq!(result, "The quick brown fox\njumps over\nthe sleepy dog.\n");
 assert!(stats.has_changes());
 ```
 
-To parse a patch that touches multiple files, use `patch_from_str` /
-`patch_from_bytes`, which return a `Vec` of per-file `Diff`s.
+To parse a patch that touches multiple files, use `Patch::from_str` /
+`Patch::from_bytes`; a `Patch` holds the per-file `Diff`s in patch order.
 
 ### Three-way merge
 
