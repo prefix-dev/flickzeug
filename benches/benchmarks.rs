@@ -122,12 +122,7 @@ fn benchmarks(c: &mut Criterion) {
     // hunk needs the interleaved offset search
     let drifted = format!("{}{}", "// drifted line\n".repeat(50), old);
     c.bench_function("apply/offset", |b| {
-        b.iter(|| {
-            black_box(apply_bytes(
-                black_box(drifted.as_bytes()),
-                black_box(&diff),
-            ))
-        })
+        b.iter(|| black_box(apply_bytes(black_box(drifted.as_bytes()), black_box(&diff))))
     });
 
     // Worst case: a patch that cannot apply, forcing a full scan at every
@@ -167,13 +162,7 @@ fn benchmarks(c: &mut Criterion) {
     // Three-way merge with both sides changed (no conflicts)
     let ours = mutate(&mut rng, &old);
     c.bench_function("merge/5k-lines", |b| {
-        b.iter(|| {
-            black_box(merge(
-                black_box(&old),
-                black_box(&ours),
-                black_box(&new),
-            ))
-        })
+        b.iter(|| black_box(merge(black_box(&old), black_box(&ours), black_box(&new))))
     });
 }
 
