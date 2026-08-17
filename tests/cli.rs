@@ -173,6 +173,19 @@ fn apply_failure_exits_one() {
 
     let output = flickzeug(&["apply", "p.patch"], &dir);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
+    // GNU patch-style reporting and reject file
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("1 out of 1 hunk FAILED -- saving rejects to file"),
+        "{stderr}"
+    );
+    let reject = fs::read_to_string(dir.join("f.txt.rej")).unwrap();
+    assert!(reject.contains("@@ -1,3 +1,3 @@"), "{reject}");
+    // The base file is untouched (no hunks applied)
+    assert_eq!(
+        fs::read_to_string(dir.join("f.txt")).unwrap(),
+        "completely unrelated\n"
+    );
 }
 
 #[test]

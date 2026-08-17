@@ -407,6 +407,27 @@ where
     T: PartialEq + FuzzyComparable + ?Sized + Text + ToOwned,
     Hunk<'a, T>: fmt::Display,
 {
+    let (lines, stats, rejected) = apply_all_partial(base_image, diff, config);
+    if let Some((index, hunk)) = rejected.into_iter().next() {
+        return Err(ApplyError(index, format!("{}", hunk)));
+    }
+    Ok((lines, stats))
+}
+
+/// Rejected hunks with their 1-based index in the diff
+type RejectedHunks<'a, T> = Vec<(usize, Hunk<'a, T>)>;
+
+/// Like [`apply_all`], but GNU patch-like: hunks that cannot be placed are
+/// skipped instead of failing the whole application, and returned as rejects
+/// together with their 1-based index in the diff.
+fn apply_all_partial<'a, T>(
+    base_image: &'a T,
+    diff: &'a Diff<'a, T>,
+    config: &ApplyConfig,
+) -> (OutputLines<'a, T>, ApplyStats, RejectedHunks<'a, T>)
+where
+    T: PartialEq + FuzzyComparable + ?Sized + Text + ToOwned,
+{
     let mut image: Vec<_> = LineIter::new(base_image)
         .map(ImageLine::Unpatched)
         .collect();
@@ -418,11 +439,13 @@ where
     };
 
     let mut stats = ApplyStats::new();
+    let mut rejected = Vec::new();
 
     for (i, hunk) in diff.hunks().iter().enumerate() {
-        let hunk_stats = apply_hunk_with_config(&mut image, hunk, config, file_line_ending)
-            .map_err(|()| ApplyError(i + 1, format!("{}", hunk)))?;
-        stats.add_hunk(hunk_stats);
+        match apply_hunk_with_config(&mut image, hunk, config, file_line_ending) {
+            Ok(hunk_stats) => stats.add_hunk(hunk_stats),
+            Err(()) => rejected.push((i + 1, hunk.clone())),
+        }
     }
 
     let preferred_line_ending = match config.line_end_strategy {
@@ -461,7 +484,89 @@ where
         })
         .collect();
 
-    Ok((lines, stats))
+    (lines, stats, rejected)
+}
+
+/// The result of a partial, GNU patch-like application from [`apply_partial`]
+/// or [`apply_bytes_partial`]: every hunk that can be placed is applied, the
+/// ones that cannot are returned instead of failing the whole file.
+///
+/// `rejected` holds the failed hunks in patch order; format them with a
+/// [`PatchFormatter`](crate::PatchFormatter) (or via a rebuilt
+/// [`Diff`]) to produce a `.rej` file like GNU patch's.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PartialApply<'a, T: ToOwned + ?Sized, C> {
+    /// The content with all applicable hunks applied (equal to the input when
+    /// every hunk was rejected)
+    pub content: C,
+    /// Statistics over the hunks that were applied
+    pub stats: ApplyStats,
+    /// The hunks that could not be applied, in patch order
+    pub rejected: Vec<Hunk<'a, T>>,
+}
+
+impl<T, C> fmt::Debug for PartialApply<'_, T, C>
+where
+    T: ToOwned + ?Sized + fmt::Debug + Text,
+    T::Owned: fmt::Debug,
+    C: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PartialApply")
+            .field("content", &self.content)
+            .field("stats", &self.stats)
+            .field("rejected", &self.rejected)
+            .finish()
+    }
+}
+
+/// Apply a `Diff`, GNU patch-style: hunks that fit are applied, hunks that do
+/// not are returned as rejects instead of failing the whole file.
+pub fn apply_partial<'a>(
+    base_image: &'a str,
+    diff: &'a Diff<'a, str>,
+    config: &ApplyConfig,
+) -> PartialApply<'a, str, String> {
+    let (lines, stats, rejected) = apply_all_partial(base_image, diff, config);
+
+    let mut content = String::with_capacity(base_image.len());
+    for (line, ending) in lines {
+        content.push_str(line);
+        if let Some(ending) = ending {
+            let e: &str = ending.into();
+            content.push_str(e);
+        }
+    }
+
+    PartialApply {
+        content,
+        stats,
+        rejected: rejected.into_iter().map(|(_, hunk)| hunk).collect(),
+    }
+}
+
+/// The bytes twin of [`apply_partial`].
+pub fn apply_bytes_partial<'a>(
+    base_image: &'a [u8],
+    diff: &'a Diff<'a, [u8]>,
+    config: &ApplyConfig,
+) -> PartialApply<'a, [u8], Vec<u8>> {
+    let (lines, stats, rejected) = apply_all_partial(base_image, diff, config);
+
+    let mut content = Vec::with_capacity(base_image.len());
+    for (line, ending) in lines {
+        content.extend_from_slice(line);
+        if let Some(ending) = ending {
+            let e: &[u8] = ending.into();
+            content.extend_from_slice(e);
+        }
+    }
+
+    PartialApply {
+        content,
+        stats,
+        rejected: rejected.into_iter().map(|(_, hunk)| hunk).collect(),
+    }
 }
 
 /// Returns `true` if `diff` already appears to be applied to `base_image`,

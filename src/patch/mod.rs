@@ -454,7 +454,7 @@ where
 }
 
 /// Represents a group of differing lines between two files
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub struct Hunk<'a, T: ?Sized + ToOwned> {
     old_range: HunkRange,
     new_range: HunkRange,
@@ -462,6 +462,19 @@ pub struct Hunk<'a, T: ?Sized + ToOwned> {
     function_context: Option<(&'a T, Option<LineEnd>)>,
 
     lines: Vec<Line<'a, T>>,
+}
+
+// Manual impl: the derive would add a spurious `T: Clone` bound, but only
+// references to `T` are stored.
+impl<T: ?Sized + ToOwned> Clone for Hunk<'_, T> {
+    fn clone(&self) -> Self {
+        Self {
+            old_range: self.old_range,
+            new_range: self.new_range,
+            function_context: self.function_context,
+            lines: self.lines.clone(),
+        }
+    }
 }
 
 impl fmt::Display for Hunk<'_, str> {
@@ -621,7 +634,7 @@ impl fmt::Display for HunkRange {
 ///
 /// A `Line` contains the terminating newline character `\n` unless it is the final
 /// line in the file and the file does not end with a newline character.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub enum Line<'a, T: ?Sized> {
     /// A line providing context in the diff which is present in both the old and new file
     Context((&'a T, Option<LineEnd>)),
@@ -629,6 +642,16 @@ pub enum Line<'a, T: ?Sized> {
     Delete((&'a T, Option<LineEnd>)),
     /// A line inserted to the new file
     Insert((&'a T, Option<LineEnd>)),
+}
+
+// Manual impls: the derives would add spurious `T: Copy`/`T: Clone` bounds,
+// but only references to `T` are stored.
+impl<T: ?Sized> Copy for Line<'_, T> {}
+
+impl<T: ?Sized> Clone for Line<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 // We want to have strings in the output whenever possible.

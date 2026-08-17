@@ -10,12 +10,12 @@
 //!
 //! The current diff implementation is based on the [Myers' diff algorithm].
 //!
-//! The documentation generally refers to "files" in many places but none of
-//! the apis explicitly operate on on-disk files. Instead this library
-//! requires that the text being operated on resides in-memory and as such if
-//! you want to perform operations on files, it is up to the user to load the
-//! contents of those files into memory before passing their contents to the
-//! apis provided by this library.
+//! The documentation generally refers to "files" in many places but the core
+//! apis operate on in-memory text: it is up to the user to load file contents
+//! before passing them in. The one exception is the [`fs`] module, which
+//! applies a multi-file [`Patch`] directly to the files in a directory —
+//! resolving names, handling creation/deletion/renames, and writing `.rej`
+//! files for rejected hunks like GNU patch.
 //!
 //! ## UTF-8 and Non-UTF-8
 //!
@@ -221,6 +221,7 @@
 
 mod apply;
 mod diff;
+pub mod fs;
 mod line_end;
 mod merge;
 mod patch;
@@ -229,9 +230,9 @@ mod utils;
 
 pub use apply::{
     ApplyConfig, ApplyError, ApplyOutcome, ApplyResult, ApplyStats, FuzzyComparable, FuzzyConfig,
-    LineEndHandling, apply, apply_bytes, apply_bytes_reporting, apply_bytes_with_config,
-    apply_reporting, apply_with_config, is_diff_applied_str_with_config,
-    is_diff_applied_with_config,
+    LineEndHandling, PartialApply, apply, apply_bytes, apply_bytes_partial, apply_bytes_reporting,
+    apply_bytes_with_config, apply_partial, apply_reporting, apply_with_config,
+    is_diff_applied_str_with_config, is_diff_applied_with_config,
 };
 pub use diff::{DiffOptions, create_patch, create_patch_bytes};
 pub use line_end::*;
