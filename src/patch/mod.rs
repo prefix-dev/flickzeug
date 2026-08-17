@@ -14,7 +14,137 @@ use crate::{LineEnd, utils::Text};
 
 const NO_NEWLINE_AT_EOF: &str = "\\ No newline at end of file";
 
-pub type Patch<'a, T> = Vec<Diff<'a, T>>;
+/// An ordered collection of per-file [`Diff`]s parsed from one patch file.
+///
+/// This is what [`Patch::from_str`] / [`Patch::from_bytes`] (and the
+/// `patch_from_*` free functions) return for patches that may touch several
+/// files. It dereferences to a slice of [`Diff`]s, so indexing, iteration and
+/// slice methods work directly:
+///
+/// ```
+/// use flickzeug::Patch;
+///
+/// let patch = Patch::from_str(
+///     "--- a/one\n+++ b/one\n@@ -1 +1 @@\n-a\n+b\n\
+///      --- a/two\n+++ b/two\n@@ -1 +1 @@\n-c\n+d\n",
+/// )
+/// .unwrap();
+///
+/// assert_eq!(patch.len(), 2);
+/// assert_eq!(patch[0].modified(), Some("one"));
+/// for diff in &patch {
+///     assert_eq!(diff.hunks().len(), 1);
+/// }
+/// ```
+#[derive(Clone, PartialEq)]
+pub struct Patch<'a, T: ToOwned + ?Sized> {
+    diffs: Vec<Diff<'a, T>>,
+}
+
+impl<'a, T: ToOwned + ?Sized> Patch<'a, T> {
+    /// The per-file diffs, in the order they appear in the patch
+    pub fn diffs(&self) -> &[Diff<'a, T>] {
+        &self.diffs
+    }
+
+    /// Consume the patch, returning its per-file diffs
+    pub fn into_diffs(self) -> Vec<Diff<'a, T>> {
+        self.diffs
+    }
+}
+
+impl<'a> Patch<'a, str> {
+    /// Parse a (potentially multi-file) patch from a string
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &'a str) -> Result<Self, ParsePatchError> {
+        patch_from_str(s)
+    }
+
+    /// Parse a (potentially multi-file) patch from a string with a custom
+    /// parser configuration
+    pub fn from_str_with_config(s: &'a str, config: ParserConfig) -> Result<Self, ParsePatchError> {
+        patch_from_str_with_config(s, config)
+    }
+}
+
+impl<'a> Patch<'a, [u8]> {
+    /// Parse a (potentially multi-file) patch from bytes
+    pub fn from_bytes(s: &'a [u8]) -> Result<Self, ParsePatchError> {
+        patch_from_bytes(s)
+    }
+
+    /// Parse a (potentially multi-file) patch from bytes with a custom parser
+    /// configuration
+    pub fn from_bytes_with_config(
+        s: &'a [u8],
+        config: ParserConfig,
+    ) -> Result<Self, ParsePatchError> {
+        patch_from_bytes_with_config(s, config)
+    }
+}
+
+impl<T: AsRef<[u8]> + ToOwned + ?Sized> Patch<'_, T> {
+    /// Convert the patch into bytes in the unified format
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for diff in &self.diffs {
+            PatchFormatter::new()
+                .write_patch_into(diff, &mut bytes)
+                .unwrap();
+        }
+        bytes
+    }
+}
+
+impl<'a, T: ToOwned + ?Sized> From<Vec<Diff<'a, T>>> for Patch<'a, T> {
+    fn from(diffs: Vec<Diff<'a, T>>) -> Self {
+        Self { diffs }
+    }
+}
+
+impl<'a, T: ToOwned + ?Sized> ops::Deref for Patch<'a, T> {
+    type Target = [Diff<'a, T>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.diffs
+    }
+}
+
+impl<'a, T: ToOwned + ?Sized> IntoIterator for Patch<'a, T> {
+    type Item = Diff<'a, T>;
+    type IntoIter = std::vec::IntoIter<Diff<'a, T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.diffs.into_iter()
+    }
+}
+
+impl<'p, 'a, T: ToOwned + ?Sized> IntoIterator for &'p Patch<'a, T> {
+    type Item = &'p Diff<'a, T>;
+    type IntoIter = std::slice::Iter<'p, Diff<'a, T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.diffs.iter()
+    }
+}
+
+impl fmt::Display for Patch<'_, str> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for diff in &self.diffs {
+            write!(f, "{}", diff)?;
+        }
+        Ok(())
+    }
+}
+
+impl<T> fmt::Debug for Patch<'_, T>
+where
+    T: ?Sized + ToOwned<Owned: Debug> + fmt::Debug + Text,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(&self.diffs).finish()
+    }
+}
 
 /// Representation of all the differences between two files
 #[derive(Clone, PartialEq, PartialOrd, Ord, Eq)]
@@ -90,25 +220,25 @@ impl<T: AsRef<[u8]> + ToOwned + ?Sized> Diff<'_, T> {
 }
 
 pub fn patch_from_str(input: &str) -> Result<Patch<'_, str>, ParsePatchError> {
-    parse::parse_multiple(input)
+    parse::parse_multiple(input).map(Patch::from)
 }
 
 pub fn patch_from_str_with_config(
     input: &str,
     config: ParserConfig,
 ) -> Result<Patch<'_, str>, ParsePatchError> {
-    parse::parse_multiple_with_config(input, config)
+    parse::parse_multiple_with_config(input, config).map(Patch::from)
 }
 
 pub fn patch_from_bytes(input: &[u8]) -> Result<Patch<'_, [u8]>, ParsePatchError> {
-    parse::parse_bytes_multiple(input)
+    parse::parse_bytes_multiple(input).map(Patch::from)
 }
 
 pub fn patch_from_bytes_with_config(
     input: &[u8],
     config: ParserConfig,
 ) -> Result<Patch<'_, [u8]>, ParsePatchError> {
-    parse::parse_bytes_multiple_with_config(input, config)
+    parse::parse_bytes_multiple_with_config(input, config).map(Patch::from)
 }
 
 impl<'a> Diff<'a, str> {
