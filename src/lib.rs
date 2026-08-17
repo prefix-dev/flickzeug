@@ -237,7 +237,7 @@ pub use diff::{DiffOptions, create_patch, create_patch_bytes};
 pub use line_end::*;
 pub use merge::{ConflictStyle, MergeOptions, merge, merge_bytes};
 pub use patch::{
-    Diff, Hunk, HunkRange, HunkRangeStrategy, Line, ParsePatchError, ParserConfig, Patch,
-    PatchFormatter, patch_from_bytes, patch_from_bytes_with_config, patch_from_str,
-    patch_from_str_with_config,
+    Diff, FileChangeKind, FileMetadata, Hunk, HunkRange, HunkRangeStrategy, Line, ParsePatchError,
+    ParsePatchErrorKind, ParserConfig, Patch, PatchFormatter, patch_from_bytes,
+    patch_from_bytes_with_config, patch_from_str, patch_from_str_with_config,
 };

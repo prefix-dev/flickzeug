@@ -2,7 +2,7 @@ mod format;
 mod parse;
 
 pub use format::PatchFormatter;
-pub use parse::{HunkRangeStrategy, ParsePatchError, ParserConfig};
+pub use parse::{HunkRangeStrategy, ParsePatchError, ParsePatchErrorKind, ParserConfig};
 
 use std::{
     borrow::Cow,
@@ -146,6 +146,41 @@ where
     }
 }
 
+/// How a [`Diff`] changes the file it refers to
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FileChangeKind {
+    /// An existing file is modified in place
+    #[default]
+    Modify,
+    /// The file is newly created (git `new file mode` header or a `/dev/null`
+    /// old side)
+    Create,
+    /// The file is deleted (git `deleted file mode` header or a `/dev/null`
+    /// new side)
+    Delete,
+    /// The file is renamed, and possibly also modified (git `rename from` /
+    /// `rename to` headers)
+    Rename,
+}
+
+/// Metadata about the file-level change described by a [`Diff`], extracted
+/// from git extended headers and explicit `/dev/null` file names.
+///
+/// For plain unified diffs without any of those markers this is
+/// [`FileChangeKind::Modify`] with no modes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct FileMetadata {
+    /// What kind of change this diff describes
+    pub kind: FileChangeKind,
+    /// Unix file mode of the old file (e.g. `0o100644`), from git's
+    /// `old mode` / `deleted file mode` headers
+    pub old_mode: Option<u32>,
+    /// Unix file mode of the new file, from git's `new mode` /
+    /// `new file mode` headers
+    pub new_mode: Option<u32>,
+}
+
 /// Representation of all the differences between two files
 #[derive(Clone, PartialEq, PartialOrd, Ord, Eq)]
 pub struct Diff<'a, T: ToOwned + ?Sized> {
@@ -155,6 +190,7 @@ pub struct Diff<'a, T: ToOwned + ?Sized> {
     original: Option<Filename<'a, T>>,
     modified: Option<Filename<'a, T>>,
     hunks: Vec<Hunk<'a, T>>,
+    metadata: FileMetadata,
 }
 
 impl<'a, T: Text + ToOwned + ?Sized> Diff<'a, T> {
@@ -173,7 +209,19 @@ impl<'a, T: Text + ToOwned + ?Sized> Diff<'a, T> {
             original,
             modified,
             hunks,
+            metadata: FileMetadata::default(),
         }
+    }
+
+    pub(crate) fn with_metadata(mut self, metadata: FileMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Metadata about the file-level change (create/delete/rename, file
+    /// modes) extracted from git extended headers and `/dev/null` sides
+    pub fn metadata(&self) -> &FileMetadata {
+        &self.metadata
     }
 
     /// Return the name of the old file
@@ -197,10 +245,21 @@ impl<'a, T: Text + ToOwned + ?Sized> Diff<'a, T> {
 
     pub fn reverse(&self) -> Diff<'_, T> {
         let hunks = self.hunks.iter().map(Hunk::reverse).collect();
+        let mut metadata = FileMetadata {
+            kind: match self.metadata.kind {
+                FileChangeKind::Create => FileChangeKind::Delete,
+                FileChangeKind::Delete => FileChangeKind::Create,
+                kind => kind,
+            },
+            ..FileMetadata::default()
+        };
+        metadata.old_mode = self.metadata.new_mode;
+        metadata.new_mode = self.metadata.old_mode;
         Diff {
             original: self.modified.clone(),
             modified: self.original.clone(),
             hunks,
+            metadata,
         }
     }
 }
@@ -288,11 +347,15 @@ where
     T: ?Sized + ToOwned<Owned: Debug> + fmt::Debug + Text,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Patch")
-            .field("original", &self.original)
-            .field("modified", &self.modified)
-            .field("hunks", &self.hunks)
-            .finish()
+        let mut s = f.debug_struct("Patch");
+        s.field("original", &self.original)
+            .field("modified", &self.modified);
+        // Keep the default (a plain modification) out of the debug output so
+        // it stays focused on what the diff actually says
+        if self.metadata != FileMetadata::default() {
+            s.field("metadata", &self.metadata);
+        }
+        s.field("hunks", &self.hunks).finish()
     }
 }
 
