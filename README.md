@@ -30,7 +30,7 @@ Add `flickzeug` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-flickzeug = "0.5"
+flickzeug = "0.6"
 ```
 
 ### Creating a diff
