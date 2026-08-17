@@ -438,10 +438,14 @@ where
         .map(ImageLine::Unpatched)
         .collect();
 
-    let file_line_ending = if image.is_empty() {
-        None
-    } else {
+    // A file without any line ending (empty, or a single line with no
+    // trailing newline) provides no evidence of a convention, so inserted
+    // lines fall back to the patch's own endings instead of a
+    // platform-dependent default.
+    let file_line_ending = if memchr::memchr(b'\n', base_image.as_bytes()).is_some() {
         Some(LineEnd::most_common(base_image))
+    } else {
+        None
     };
 
     let mut stats = ApplyStats::new();
@@ -1476,6 +1480,25 @@ mod test {
         let diff = Diff::from_str(patch).unwrap();
         let (out, _) = apply(base, &diff).unwrap();
         assert_eq!(out, "one\r\ninserted\r\ntwo\r\nthree\r\n");
+    }
+
+    #[test]
+    fn keep_original_endingless_file_keeps_patch_ending() {
+        // A base file with no line endings at all gives no convention to
+        // inherit; the inserted line must keep the patch's ending on every
+        // platform (LineEnd::most_common would tie-break on cfg!(windows)).
+        let base = "old line";
+        let patch = "\
+--- a
++++ b
+@@ -1 +1 @@
+-old line
+\\ No newline at end of file
++new line
+";
+        let diff = Diff::from_str(patch).unwrap();
+        let (out, _) = apply(base, &diff).unwrap();
+        assert_eq!(out, "new line\n");
     }
 
     #[test]
