@@ -103,8 +103,11 @@ flickzeug merge ours.txt base.txt theirs.txt
 
 `apply` understands file creation (`/dev/null`), deletion, and git rename
 metadata, supports `--reverse`, `--dry-run`, `--lenient` (recount hunk
-headers) and `-p/--strip`, and exits with GNU-style status codes
-(0 success, 1 hunks failed, 2 trouble).
+headers) and `-p/--strip`, applies partially like GNU patch (hunks that
+fail are saved to `<file>.rej`), and exits with GNU-style status codes
+(0 success, 1 hunks failed, 2 trouble). The same functionality is
+available as a library API in the `flickzeug::fs` module
+(`apply_patch_dir`).
 
 Compatibility with the reference tools is tested end-to-end
 (`tests/compat.rs`): unified diff output is byte-identical to GNU diff,
