@@ -565,8 +565,12 @@ pub fn apply_bytes_partial<'a>(
 ///
 /// A diff counts as already applied only if every hunk's *post-image* — its
 /// context lines together with its inserted lines, in order and contiguous —
-/// is found in `base_image`. Lines are compared strictly (whitespace/case are
-/// normalized per `config`, but no similarity threshold and no fuzz applies).
+/// is found in `base_image`. Context lines are compared modulo the
+/// whitespace/case normalization from `config` (no similarity threshold, no
+/// fuzz); inserted lines must match byte-for-byte, because they are the only
+/// evidence that the hunk was applied — under `ignore_whitespace` a hunk
+/// whose insertions differ from its deletions only in whitespace would
+/// otherwise be misreported as applied on the *un*patched content.
 ///
 /// Neither a forward apply nor a reverse round-trip is a reliable signal under
 /// fuzzy matching. On already-applied content a forward apply may fail (a
@@ -654,7 +658,21 @@ fn is_hunk_applied<T>(
 where
     T: FuzzyComparable + ?Sized + Text + ToOwned,
 {
-    let post_image_lines: Vec<_> = post_image(hunk.lines()).collect();
+    // Inserted lines are the only evidence that the hunk was actually
+    // applied, so they must match byte-for-byte; context lines tolerate the
+    // whitespace/case normalization from `config`. Under `ignore_whitespace`
+    // a hunk whose insertions differ from its deletions only in whitespace
+    // would otherwise normalize to the *un*patched content and be
+    // misreported as already applied.
+    let post_image_lines: Vec<_> = hunk
+        .lines()
+        .iter()
+        .filter_map(|line| match *line {
+            Line::Context(l) => Some((l, false)),
+            Line::Insert(l) => Some((l, true)),
+            Line::Delete(_) => None,
+        })
+        .collect();
     if post_image_lines.is_empty() {
         return false;
     }
@@ -672,18 +690,18 @@ where
         return true;
     }
 
-    let pre_image_lines: Vec<_> = pre_image(hunk.lines()).collect();
+    let pre_image_lines: Vec<_> = pre_image(hunk.lines()).map(|line| (line, false)).collect();
     let pre_start = hunk.old_range().start().saturating_sub(1);
     find_lines_position(image, &pre_image_lines, pre_start, config).is_none()
 }
 
-/// Search `image` for a position where `lines` occur contiguously, comparing
-/// lines strictly (equality modulo the whitespace/case normalization from
-/// `config`, without any similarity threshold). Returns `None` if `lines` is
-/// empty.
+/// Search `image` for a position where `lines` occur contiguously. Each line
+/// carries an `exact` flag: `true` requires byte equality, `false` allows
+/// equality modulo the whitespace/case normalization from `config` (never a
+/// similarity threshold). Returns `None` if `lines` is empty.
 fn find_lines_position<T>(
     image: &[(&T, Option<LineEnd>)],
-    lines: &[(&T, Option<LineEnd>)],
+    lines: &[((&T, Option<LineEnd>), bool)],
     start_hint: usize,
     config: &ApplyConfig,
 ) -> Option<usize>
@@ -696,13 +714,17 @@ where
 
     let match_at = |pos: usize| -> bool {
         image.get(pos..pos + lines.len()).is_some_and(|window| {
-            lines.iter().zip(window).all(|(line, image_line)| {
+            lines.iter().zip(window).all(|((line, exact), image_line)| {
                 // Whether a line ending exists is semantic (the "\ No newline
                 // at end of file" marker): a diff that only adds or removes
                 // the trailing newline must not count as already applied.
                 // Which ending it is (LF vs CRLF) is convention and ignored.
                 line.1.is_some() == image_line.1.is_some()
-                    && line.0.normalized_eq(image_line.0, config)
+                    && if *exact {
+                        line.0 == image_line.0
+                    } else {
+                        line.0.normalized_eq(image_line.0, config)
+                    }
             })
         })
     };
@@ -1721,6 +1743,45 @@ mod test {
 
         assert!(!is_diff_applied_with_config(pre, &diff, &config));
         assert!(is_diff_applied_with_config(post, &diff, &config));
+    }
+
+    #[test]
+    fn test_is_diff_applied_whitespace_only_change() {
+        // A patch whose inserted lines differ from the deleted ones only in
+        // whitespace (here: srsly's JSON tests gaining a space after each
+        // key). Under `ignore_whitespace` the whole change vanishes when
+        // normalized, so a normalized post-image search finds the *un*patched
+        // content and misreports the diff as already applied — silently
+        // skipping a patch that is real and required.
+        let patch = "\
+--- a/srsly/tests/test_json_api.py
++++ b/srsly/tests/test_json_api.py
+@@ -1,4 +1,4 @@
+ expected = [
+-    '{\"hello\":\"world\"}',
+-    '{\"test\":123}',
++    '{\"hello\": \"world\"}',
++    '{\"test\": 123}',
+ ]
+";
+        let diff = Diff::from_bytes(patch.as_bytes()).unwrap();
+        let config = fuzzy_config();
+
+        let pre: &[u8] = b"expected = [\n    '{\"hello\":\"world\"}',\n    '{\"test\":123}',\n]\n";
+        let post: &[u8] =
+            b"expected = [\n    '{\"hello\": \"world\"}',\n    '{\"test\": 123}',\n]\n";
+
+        assert!(!is_diff_applied_with_config(pre, &diff, &config));
+        assert!(is_diff_applied_with_config(post, &diff, &config));
+
+        match apply_bytes_reporting(pre, &diff, &config) {
+            ApplyOutcome::Applied(content, _) => assert_eq!(content, post),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        match apply_bytes_reporting(post, &diff, &config) {
+            ApplyOutcome::AlreadyApplied(content) => assert_eq!(content, post),
+            other => panic!("expected AlreadyApplied, got {other:?}"),
+        }
     }
 
     #[test]
