@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0](https://github.com/prefix-dev/flickzeug/compare/v0.5.4...v0.6.0) - 2026-08-21
+
+### Added
+
+- [**breaking**] Patch newtype, .rej rejects + directory apply API, located parse errors, git metadata, benchmarks ([#27](https://github.com/prefix-dev/flickzeug/pull/27))
+- [**breaking**] GNU-compatible defaults, standalone CLI tools, and a GNU/git compatibility suite ([#24](https://github.com/prefix-dev/flickzeug/pull/24))
+
+### Other
+
+- *(deps)* update rust crate criterion to 0.8 ([#28](https://github.com/prefix-dev/flickzeug/pull/28))
+- *(deps)* update actions/upload-artifact action to v7 ([#26](https://github.com/prefix-dev/flickzeug/pull/26))
+
 ## [0.5.4](https://github.com/prefix-dev/flickzeug/compare/v0.5.3...v0.5.4) - 2026-07-30
 
 ### Fixed
