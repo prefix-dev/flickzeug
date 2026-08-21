@@ -2,7 +2,7 @@ mod format;
 mod parse;
 
 pub use format::PatchFormatter;
-pub use parse::{HunkRangeStrategy, ParsePatchError, ParserConfig};
+pub use parse::{HunkRangeStrategy, ParsePatchError, ParsePatchErrorKind, ParserConfig};
 
 use std::{
     borrow::Cow,
@@ -14,7 +14,172 @@ use crate::{LineEnd, utils::Text};
 
 const NO_NEWLINE_AT_EOF: &str = "\\ No newline at end of file";
 
-pub type Patch<'a, T> = Vec<Diff<'a, T>>;
+/// An ordered collection of per-file [`Diff`]s parsed from one patch file.
+///
+/// This is what [`Patch::from_str`] / [`Patch::from_bytes`] (and the
+/// `patch_from_*` free functions) return for patches that may touch several
+/// files. It dereferences to a slice of [`Diff`]s, so indexing, iteration and
+/// slice methods work directly:
+///
+/// ```
+/// use flickzeug::Patch;
+///
+/// let patch = Patch::from_str(
+///     "--- a/one\n+++ b/one\n@@ -1 +1 @@\n-a\n+b\n\
+///      --- a/two\n+++ b/two\n@@ -1 +1 @@\n-c\n+d\n",
+/// )
+/// .unwrap();
+///
+/// assert_eq!(patch.len(), 2);
+/// assert_eq!(patch[0].modified(), Some("one"));
+/// for diff in &patch {
+///     assert_eq!(diff.hunks().len(), 1);
+/// }
+/// ```
+#[derive(Clone, PartialEq)]
+pub struct Patch<'a, T: ToOwned + ?Sized> {
+    diffs: Vec<Diff<'a, T>>,
+}
+
+impl<'a, T: ToOwned + ?Sized> Patch<'a, T> {
+    /// The per-file diffs, in the order they appear in the patch
+    pub fn diffs(&self) -> &[Diff<'a, T>] {
+        &self.diffs
+    }
+
+    /// Consume the patch, returning its per-file diffs
+    pub fn into_diffs(self) -> Vec<Diff<'a, T>> {
+        self.diffs
+    }
+}
+
+impl<'a> Patch<'a, str> {
+    /// Parse a (potentially multi-file) patch from a string
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &'a str) -> Result<Self, ParsePatchError> {
+        patch_from_str(s)
+    }
+
+    /// Parse a (potentially multi-file) patch from a string with a custom
+    /// parser configuration
+    pub fn from_str_with_config(s: &'a str, config: ParserConfig) -> Result<Self, ParsePatchError> {
+        patch_from_str_with_config(s, config)
+    }
+}
+
+impl<'a> Patch<'a, [u8]> {
+    /// Parse a (potentially multi-file) patch from bytes
+    pub fn from_bytes(s: &'a [u8]) -> Result<Self, ParsePatchError> {
+        patch_from_bytes(s)
+    }
+
+    /// Parse a (potentially multi-file) patch from bytes with a custom parser
+    /// configuration
+    pub fn from_bytes_with_config(
+        s: &'a [u8],
+        config: ParserConfig,
+    ) -> Result<Self, ParsePatchError> {
+        patch_from_bytes_with_config(s, config)
+    }
+}
+
+impl<T: AsRef<[u8]> + ToOwned + ?Sized> Patch<'_, T> {
+    /// Convert the patch into bytes in the unified format
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for diff in &self.diffs {
+            PatchFormatter::new()
+                .write_patch_into(diff, &mut bytes)
+                .unwrap();
+        }
+        bytes
+    }
+}
+
+impl<'a, T: ToOwned + ?Sized> From<Vec<Diff<'a, T>>> for Patch<'a, T> {
+    fn from(diffs: Vec<Diff<'a, T>>) -> Self {
+        Self { diffs }
+    }
+}
+
+impl<'a, T: ToOwned + ?Sized> ops::Deref for Patch<'a, T> {
+    type Target = [Diff<'a, T>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.diffs
+    }
+}
+
+impl<'a, T: ToOwned + ?Sized> IntoIterator for Patch<'a, T> {
+    type Item = Diff<'a, T>;
+    type IntoIter = std::vec::IntoIter<Diff<'a, T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.diffs.into_iter()
+    }
+}
+
+impl<'p, 'a, T: ToOwned + ?Sized> IntoIterator for &'p Patch<'a, T> {
+    type Item = &'p Diff<'a, T>;
+    type IntoIter = std::slice::Iter<'p, Diff<'a, T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.diffs.iter()
+    }
+}
+
+impl fmt::Display for Patch<'_, str> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for diff in &self.diffs {
+            write!(f, "{}", diff)?;
+        }
+        Ok(())
+    }
+}
+
+impl<T> fmt::Debug for Patch<'_, T>
+where
+    T: ?Sized + ToOwned<Owned: Debug> + fmt::Debug + Text,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(&self.diffs).finish()
+    }
+}
+
+/// How a [`Diff`] changes the file it refers to
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FileChangeKind {
+    /// An existing file is modified in place
+    #[default]
+    Modify,
+    /// The file is newly created (git `new file mode` header or a `/dev/null`
+    /// old side)
+    Create,
+    /// The file is deleted (git `deleted file mode` header or a `/dev/null`
+    /// new side)
+    Delete,
+    /// The file is renamed, and possibly also modified (git `rename from` /
+    /// `rename to` headers)
+    Rename,
+}
+
+/// Metadata about the file-level change described by a [`Diff`], extracted
+/// from git extended headers and explicit `/dev/null` file names.
+///
+/// For plain unified diffs without any of those markers this is
+/// [`FileChangeKind::Modify`] with no modes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct FileMetadata {
+    /// What kind of change this diff describes
+    pub kind: FileChangeKind,
+    /// Unix file mode of the old file (e.g. `0o100644`), from git's
+    /// `old mode` / `deleted file mode` headers
+    pub old_mode: Option<u32>,
+    /// Unix file mode of the new file, from git's `new mode` /
+    /// `new file mode` headers
+    pub new_mode: Option<u32>,
+}
 
 /// Representation of all the differences between two files
 #[derive(Clone, PartialEq, PartialOrd, Ord, Eq)]
@@ -25,6 +190,7 @@ pub struct Diff<'a, T: ToOwned + ?Sized> {
     original: Option<Filename<'a, T>>,
     modified: Option<Filename<'a, T>>,
     hunks: Vec<Hunk<'a, T>>,
+    metadata: FileMetadata,
 }
 
 impl<'a, T: Text + ToOwned + ?Sized> Diff<'a, T> {
@@ -43,7 +209,19 @@ impl<'a, T: Text + ToOwned + ?Sized> Diff<'a, T> {
             original,
             modified,
             hunks,
+            metadata: FileMetadata::default(),
         }
+    }
+
+    pub(crate) fn with_metadata(mut self, metadata: FileMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Metadata about the file-level change (create/delete/rename, file
+    /// modes) extracted from git extended headers and `/dev/null` sides
+    pub fn metadata(&self) -> &FileMetadata {
+        &self.metadata
     }
 
     /// Return the name of the old file
@@ -67,10 +245,21 @@ impl<'a, T: Text + ToOwned + ?Sized> Diff<'a, T> {
 
     pub fn reverse(&self) -> Diff<'_, T> {
         let hunks = self.hunks.iter().map(Hunk::reverse).collect();
+        let mut metadata = FileMetadata {
+            kind: match self.metadata.kind {
+                FileChangeKind::Create => FileChangeKind::Delete,
+                FileChangeKind::Delete => FileChangeKind::Create,
+                kind => kind,
+            },
+            ..FileMetadata::default()
+        };
+        metadata.old_mode = self.metadata.new_mode;
+        metadata.new_mode = self.metadata.old_mode;
         Diff {
             original: self.modified.clone(),
             modified: self.original.clone(),
             hunks,
+            metadata,
         }
     }
 }
@@ -90,25 +279,25 @@ impl<T: AsRef<[u8]> + ToOwned + ?Sized> Diff<'_, T> {
 }
 
 pub fn patch_from_str(input: &str) -> Result<Patch<'_, str>, ParsePatchError> {
-    parse::parse_multiple(input)
+    parse::parse_multiple(input).map(Patch::from)
 }
 
 pub fn patch_from_str_with_config(
     input: &str,
     config: ParserConfig,
 ) -> Result<Patch<'_, str>, ParsePatchError> {
-    parse::parse_multiple_with_config(input, config)
+    parse::parse_multiple_with_config(input, config).map(Patch::from)
 }
 
 pub fn patch_from_bytes(input: &[u8]) -> Result<Patch<'_, [u8]>, ParsePatchError> {
-    parse::parse_bytes_multiple(input)
+    parse::parse_bytes_multiple(input).map(Patch::from)
 }
 
 pub fn patch_from_bytes_with_config(
     input: &[u8],
     config: ParserConfig,
 ) -> Result<Patch<'_, [u8]>, ParsePatchError> {
-    parse::parse_bytes_multiple_with_config(input, config)
+    parse::parse_bytes_multiple_with_config(input, config).map(Patch::from)
 }
 
 impl<'a> Diff<'a, str> {
@@ -158,11 +347,15 @@ where
     T: ?Sized + ToOwned<Owned: Debug> + fmt::Debug + Text,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Patch")
-            .field("original", &self.original)
-            .field("modified", &self.modified)
-            .field("hunks", &self.hunks)
-            .finish()
+        let mut s = f.debug_struct("Patch");
+        s.field("original", &self.original)
+            .field("modified", &self.modified);
+        // Keep the default (a plain modification) out of the debug output so
+        // it stays focused on what the diff actually says
+        if self.metadata != FileMetadata::default() {
+            s.field("metadata", &self.metadata);
+        }
+        s.field("hunks", &self.hunks).finish()
     }
 }
 
@@ -261,7 +454,7 @@ where
 }
 
 /// Represents a group of differing lines between two files
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub struct Hunk<'a, T: ?Sized + ToOwned> {
     old_range: HunkRange,
     new_range: HunkRange,
@@ -269,6 +462,19 @@ pub struct Hunk<'a, T: ?Sized + ToOwned> {
     function_context: Option<(&'a T, Option<LineEnd>)>,
 
     lines: Vec<Line<'a, T>>,
+}
+
+// Manual impl: the derive would add a spurious `T: Clone` bound, but only
+// references to `T` are stored.
+impl<T: ?Sized + ToOwned> Clone for Hunk<'_, T> {
+    fn clone(&self) -> Self {
+        Self {
+            old_range: self.old_range,
+            new_range: self.new_range,
+            function_context: self.function_context,
+            lines: self.lines.clone(),
+        }
+    }
 }
 
 impl fmt::Display for Hunk<'_, str> {
@@ -428,7 +634,7 @@ impl fmt::Display for HunkRange {
 ///
 /// A `Line` contains the terminating newline character `\n` unless it is the final
 /// line in the file and the file does not end with a newline character.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub enum Line<'a, T: ?Sized> {
     /// A line providing context in the diff which is present in both the old and new file
     Context((&'a T, Option<LineEnd>)),
@@ -436,6 +642,16 @@ pub enum Line<'a, T: ?Sized> {
     Delete((&'a T, Option<LineEnd>)),
     /// A line inserted to the new file
     Insert((&'a T, Option<LineEnd>)),
+}
+
+// Manual impls: the derives would add spurious `T: Copy`/`T: Clone` bounds,
+// but only references to `T` are stored.
+impl<T: ?Sized> Copy for Line<'_, T> {}
+
+impl<T: ?Sized> Clone for Line<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 // We want to have strings in the output whenever possible.

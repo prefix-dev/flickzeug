@@ -1,5 +1,6 @@
 ---
 source: src/patch/parse.rs
+assertion_line: 1020
 expression: patches
 input_file: src/patch/test-data/pure-renames.patch
 ---
@@ -959,6 +960,13 @@ Ok(
                     "tinygrad/frontend/__init__.py",
                 ),
             ),
+            metadata: FileMetadata {
+                kind: Delete,
+                old_mode: Some(
+                    33188,
+                ),
+                new_mode: None,
+            },
             hunks: [],
         },
         Patch {
@@ -972,6 +980,11 @@ Ok(
                     "tinygrad/nn/onnx.py",
                 ),
             ),
+            metadata: FileMetadata {
+                kind: Rename,
+                old_mode: None,
+                new_mode: None,
+            },
             hunks: [],
         },
         Patch {
@@ -985,6 +998,11 @@ Ok(
                     "tinygrad/nn/torch.py",
                 ),
             ),
+            metadata: FileMetadata {
+                kind: Rename,
+                old_mode: None,
+                new_mode: None,
+            },
             hunks: [],
         },
     ],

@@ -351,6 +351,60 @@ fn reverse_apply_matches_gnu_patch() {
     );
 }
 
+/// Partial application must match GNU patch: hunks that fit are applied, the
+/// rest go to `<file>.rej` — byte-identical content and reject files.
+#[test]
+fn rejects_match_gnu_patch() {
+    if !have_gnu_patch() {
+        return;
+    }
+
+    let base = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n";
+    // First hunk applies, second one's context does not exist
+    let patch = "\
+--- f.txt
++++ f.txt
+@@ -1,3 +1,3 @@
+ a
+-b
++B
+ c
+@@ -8,3 +8,3 @@
+ WRONG
+-CONTEXT
++NOPE
+ HERE
+";
+
+    let dir = scratch_dir("rejects");
+    fs::create_dir_all(dir.join("tree-gnu")).unwrap();
+    fs::create_dir_all(dir.join("tree-flick")).unwrap();
+    fs::write(dir.join("tree-gnu/f.txt"), base).unwrap();
+    fs::write(dir.join("tree-flick/f.txt"), base).unwrap();
+    fs::write(dir.join("p.patch"), patch).unwrap();
+
+    let gnu = run(Command::new("patch")
+        .args(["--batch", "-p0", "-i", "../p.patch"])
+        .current_dir(dir.join("tree-gnu")));
+    assert_eq!(gnu.status.code(), Some(1), "{gnu:?}");
+
+    let flick = flickzeug(&["apply", "../p.patch"], &dir.join("tree-flick"));
+    assert_eq!(flick.status.code(), Some(1), "{flick:?}");
+
+    // Same partially-patched file content
+    assert_eq!(
+        fs::read_to_string(dir.join("tree-gnu/f.txt")).unwrap(),
+        fs::read_to_string(dir.join("tree-flick/f.txt")).unwrap(),
+        "partially patched content differs from GNU patch"
+    );
+    // Same reject file, byte for byte
+    assert_eq!(
+        fs::read_to_string(dir.join("tree-gnu/f.txt.rej")).unwrap(),
+        fs::read_to_string(dir.join("tree-flick/f.txt.rej")).unwrap(),
+        "reject file differs from GNU patch"
+    );
+}
+
 /// A patch that does not apply must fail with exit code 1 in both tools.
 #[test]
 fn failed_apply_exit_codes_match_gnu_patch() {

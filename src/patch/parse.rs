@@ -3,15 +3,19 @@
 use super::{ESCAPED_CHARS_BYTES, Hunk, HunkRange, Line, NO_NEWLINE_AT_EOF};
 use crate::{
     LineEnd,
-    patch::Diff,
+    patch::{Diff, FileChangeKind, FileMetadata},
     utils::{LineIter, Text},
 };
 use std::{borrow::Cow, fmt};
 
 type Result<T, E = ParsePatchError> = std::result::Result<T, E>;
 
+/// Result type for helpers that do not know the input position; the caller
+/// attaches the line number.
+type KindResult<T, E = ParsePatchErrorKind> = std::result::Result<T, E>;
+
 /// Kind of line start in `Hunk` header.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeaderLineKind {
     Adding,
     Removing,
@@ -32,9 +36,37 @@ impl fmt::Display for HeaderLineKind {
 
 /// An error returned when parsing a patch (e.g. via [`Diff::from_str`]) fails
 ///
+/// Carries [what went wrong](Self::kind) and the 1-based [line
+/// number](Self::line) in the parsed input it refers to.
+///
 /// [`Diff::from_str`]: crate::Diff::from_str
-#[derive(thiserror::Error, Debug)]
-pub enum ParsePatchError {
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[error("{kind} (line {line})")]
+pub struct ParsePatchError {
+    kind: ParsePatchErrorKind,
+    line: usize,
+}
+
+impl ParsePatchError {
+    fn new(kind: ParsePatchErrorKind, line: usize) -> Self {
+        Self { kind, line }
+    }
+
+    /// What went wrong
+    pub fn kind(&self) -> &ParsePatchErrorKind {
+        &self.kind
+    }
+
+    /// The 1-based line number in the parsed input the error refers to
+    pub fn line(&self) -> usize {
+        self.line
+    }
+}
+
+/// The kinds of error that can occur while parsing a patch
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParsePatchErrorKind {
     #[error("unexpected end of file")]
     UnexpectedEof,
     #[error("multiple '{0}' lines")]
@@ -130,6 +162,8 @@ impl Default for ParserConfig {
 struct Parser<'a, T: Text + ?Sized> {
     lines: std::iter::Peekable<LineIter<'a, T>>,
     config: ParserConfig,
+    /// 1-based line number of the line `peek()` currently refers to
+    line: usize,
 }
 
 impl<'a, T: Text + ?Sized> Parser<'a, T> {
@@ -141,6 +175,7 @@ impl<'a, T: Text + ?Sized> Parser<'a, T> {
         Self {
             lines: LineIter::new(input).peekable(),
             config,
+            line: 1,
         }
     }
 
@@ -149,8 +184,22 @@ impl<'a, T: Text + ?Sized> Parser<'a, T> {
     }
 
     fn next(&mut self) -> Result<(&'a T, Option<LineEnd>)> {
-        let line = self.lines.next().ok_or(ParsePatchError::UnexpectedEof)?;
+        let line = self
+            .lines
+            .next()
+            .ok_or_else(|| self.err(ParsePatchErrorKind::UnexpectedEof))?;
+        self.line += 1;
         Ok(line)
+    }
+
+    /// An error at the current (peeked) line
+    fn err(&self, kind: ParsePatchErrorKind) -> ParsePatchError {
+        ParsePatchError::new(kind, self.line)
+    }
+
+    /// An error at a specific line
+    fn err_at(&self, line: usize, kind: ParsePatchErrorKind) -> ParsePatchError {
+        ParsePatchError::new(kind, line)
     }
 }
 
@@ -180,19 +229,28 @@ where
     loop {
         match (patch_header(&mut parser), hunks(&mut parser)) {
             (Ok(header), Ok(hunks)) => {
-                let original = header.0.map(|(line, _end)| convert(line));
-                let modified = header.1.map(|(line, _end)| convert(line));
-                patches.push(Diff::new(original, modified, hunks))
+                let metadata = header.resolved_metadata();
+                let original = header.original.map(|(line, _end)| convert(line));
+                let modified = header.modified.map(|(line, _end)| convert(line));
+                patches.push(Diff::new(original, modified, hunks).with_metadata(metadata))
             }
             // No header and no hunks left: end of input (or trailing junk)
-            (Ok((None, None)), Err(ParsePatchError::NoHunks)) => break,
-            // Allow NoHunks error when we have valid headers (pure renames/deletes/adds)
-            (Ok(header), Err(ParsePatchError::NoHunks))
-                if header.0.is_some() || header.1.is_some() =>
+            (Ok(header), Err(e))
+                if header.original.is_none()
+                    && header.modified.is_none()
+                    && *e.kind() == ParsePatchErrorKind::NoHunks =>
             {
-                let original = header.0.map(|(line, _end)| convert(line));
-                let modified = header.1.map(|(line, _end)| convert(line));
-                patches.push(Diff::new(original, modified, vec![]))
+                break;
+            }
+            // Allow NoHunks error when we have valid headers (pure renames/deletes/adds)
+            (Ok(header), Err(e))
+                if *e.kind() == ParsePatchErrorKind::NoHunks
+                    && (header.original.is_some() || header.modified.is_some()) =>
+            {
+                let metadata = header.resolved_metadata();
+                let original = header.original.map(|(line, _end)| convert(line));
+                let modified = header.modified.map(|(line, _end)| convert(line));
+                patches.push(Diff::new(original, modified, vec![]).with_metadata(metadata))
             }
             (Ok(_), Err(e)) | (Err(e), _) => {
                 return Err(e);
@@ -207,26 +265,28 @@ pub fn parse(input: &str) -> Result<Diff<'_, str>> {
     let header = patch_header(&mut parser)?;
     let hunks = parse_hunks_allowing_empty(&mut parser, &header)?;
 
-    let original = header.0.map(|(line, _end)| convert_cow_to_str(line));
-    let modified = header.1.map(|(line, _end)| convert_cow_to_str(line));
+    let metadata = header.resolved_metadata();
+    let original = header.original.map(|(line, _end)| convert_cow_to_str(line));
+    let modified = header.modified.map(|(line, _end)| convert_cow_to_str(line));
 
-    Ok(Diff::new(original, modified, hunks))
+    Ok(Diff::new(original, modified, hunks).with_metadata(metadata))
 }
 
 // A diff that has filename headers but no hunks is valid (a pure rename, a
 // metadata-only change, or a diff between identical files); `parse_multiple`
 // accepts these, so the single-diff front ends do too.
-#[allow(clippy::type_complexity)]
 fn parse_hunks_allowing_empty<'a, T: Text + ?Sized + ToOwned>(
     parser: &mut Parser<'a, T>,
-    header: &(
-        Option<(Cow<'a, [u8]>, Option<LineEnd>)>,
-        Option<(Cow<'a, [u8]>, Option<LineEnd>)>,
-    ),
+    header: &ParsedHeader<'a>,
 ) -> Result<Vec<Hunk<'a, T>>> {
     match hunks(parser) {
         Ok(hunks) => Ok(hunks),
-        Err(ParsePatchError::NoHunks) if header.0.is_some() || header.1.is_some() => Ok(vec![]),
+        Err(err)
+            if *err.kind() == ParsePatchErrorKind::NoHunks
+                && (header.original.is_some() || header.modified.is_some()) =>
+        {
+            Ok(vec![])
+        }
         Err(err) => Err(err),
     }
 }
@@ -247,10 +307,11 @@ pub fn parse_bytes(input: &[u8]) -> Result<Diff<'_, [u8]>> {
     let header = patch_header(&mut parser)?;
     let hunks = parse_hunks_allowing_empty(&mut parser, &header)?;
 
-    let original = header.0.map(|(line, _end)| line);
-    let modified = header.1.map(|(line, _end)| line);
+    let metadata = header.resolved_metadata();
+    let original = header.original.map(|(line, _end)| line);
+    let modified = header.modified.map(|(line, _end)| line);
 
-    Ok(Diff::new(original, modified, hunks))
+    Ok(Diff::new(original, modified, hunks).with_metadata(metadata))
 }
 
 // This is only used when the type originated as a utf8 string
@@ -261,14 +322,39 @@ fn convert_cow_to_str(cow: Cow<'_, [u8]>) -> Cow<'_, str> {
     }
 }
 
-#[allow(clippy::type_complexity)]
+type HeaderFilename<'a> = Option<(Cow<'a, [u8]>, Option<LineEnd>)>;
+
+/// The resolved file names and metadata of one diff's header section
+struct ParsedHeader<'a> {
+    original: HeaderFilename<'a>,
+    modified: HeaderFilename<'a>,
+    /// Whether the old/new side was explicitly given as /dev/null (a missing
+    /// header also yields `None` names, but does not signal create/delete)
+    original_is_dev_null: bool,
+    modified_is_dev_null: bool,
+    metadata: FileMetadata,
+}
+
+impl ParsedHeader<'_> {
+    /// The metadata with the change kind inferred from explicit /dev/null
+    /// sides when the git headers did not already determine it.
+    fn resolved_metadata(&self) -> FileMetadata {
+        let mut metadata = self.metadata.clone();
+        if metadata.kind == FileChangeKind::Modify {
+            metadata.kind = match (self.original_is_dev_null, self.modified_is_dev_null) {
+                (true, false) => FileChangeKind::Create,
+                (false, true) => FileChangeKind::Delete,
+                _ => FileChangeKind::Modify,
+            };
+        }
+        metadata
+    }
+}
+
 fn patch_header<'a, T: Text + ToOwned + ?Sized>(
     parser: &mut Parser<'a, T>,
-) -> Result<(
-    Option<(Cow<'a, [u8]>, Option<LineEnd>)>,
-    Option<(Cow<'a, [u8]>, Option<LineEnd>)>,
-)> {
-    let (git_original, git_modified) = header_preamble(parser)?;
+) -> Result<ParsedHeader<'a>> {
+    let preamble = header_preamble(parser)?;
     let strip_ab_prefix = parser.config.strip_ab_prefix;
 
     let mut filename1 = None;
@@ -279,18 +365,24 @@ fn patch_header<'a, T: Text + ToOwned + ?Sized>(
     while let Some((line, _end)) = parser.peek() {
         if line.starts_with("--- ") {
             if saw_traditional_header1 {
-                return Err(ParsePatchError::HeaderMultipleLines(
+                return Err(parser.err(ParsePatchErrorKind::HeaderMultipleLines(
                     HeaderLineKind::Removing,
-                ));
+                )));
             }
             saw_traditional_header1 = true;
-            filename1 = parse_filename("--- ", parser.next()?, strip_ab_prefix)?;
+            let line_no = parser.line;
+            filename1 = parse_filename("--- ", parser.next()?, strip_ab_prefix)
+                .map_err(|kind| parser.err_at(line_no, kind))?;
         } else if line.starts_with("+++ ") {
             if saw_traditional_header2 {
-                return Err(ParsePatchError::HeaderMultipleLines(HeaderLineKind::Adding));
+                return Err(parser.err(ParsePatchErrorKind::HeaderMultipleLines(
+                    HeaderLineKind::Adding,
+                )));
             }
             saw_traditional_header2 = true;
-            filename2 = parse_filename("+++ ", parser.next()?, strip_ab_prefix)?;
+            let line_no = parser.line;
+            filename2 = parse_filename("+++ ", parser.next()?, strip_ab_prefix)
+                .map_err(|kind| parser.err_at(line_no, kind))?;
         } else {
             break;
         }
@@ -299,37 +391,51 @@ fn patch_header<'a, T: Text + ToOwned + ?Sized>(
     // Traditional --- +++ headers take precedence over git metadata
     // If we saw a traditional header (even if it parsed to None for /dev/null), use it
     // Otherwise fall back to git metadata
-    let original = if saw_traditional_header1 {
-        filename1
+    let (original, original_is_dev_null) = if saw_traditional_header1 {
+        let is_dev_null = filename1.is_none();
+        (filename1, is_dev_null)
     } else {
-        git_original
+        (preamble.original, preamble.original_is_dev_null)
     };
-    let modified = if saw_traditional_header2 {
-        filename2
+    let (modified, modified_is_dev_null) = if saw_traditional_header2 {
+        let is_dev_null = filename2.is_none();
+        (filename2, is_dev_null)
     } else {
-        git_modified
+        (preamble.modified, preamble.modified_is_dev_null)
     };
 
-    Ok((original, modified))
+    Ok(ParsedHeader {
+        original,
+        modified,
+        original_is_dev_null,
+        modified_is_dev_null,
+        metadata: preamble.metadata,
+    })
 }
 
-// Parse the patch header preamble, extracting filenames from git metadata.
-// Skips preamble lines like "diff --git", git metadata, etc., until reaching
-// the first filename header ("--- " or "+++ ") or hunk line.
-// Returns extracted filenames from git metadata (for pure renames/deletes/adds).
-#[allow(clippy::type_complexity)]
+/// Parse an octal file mode like `100644` from a git extended header
+fn parse_mode<T: Text + ?Sized>(s: &T) -> Option<u32> {
+    std::str::from_utf8(s.as_bytes())
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim(), 8).ok())
+}
+
+// Parse the patch header preamble, extracting filenames and metadata from git
+// extended headers. Skips preamble lines like "diff --git", git metadata,
+// etc., until reaching the first filename header ("--- " or "+++ ") or hunk
+// line.
 fn header_preamble<'a, T: Text + ToOwned + ?Sized>(
     parser: &mut Parser<'a, T>,
-) -> Result<(
-    Option<(Cow<'a, [u8]>, Option<LineEnd>)>,
-    Option<(Cow<'a, [u8]>, Option<LineEnd>)>,
-)> {
+) -> Result<ParsedHeader<'a>> {
     let strip_ab_prefix = parser.config.strip_ab_prefix;
     let mut git_original = None;
     let mut git_modified = None;
+    let mut original_is_dev_null = false;
+    let mut modified_is_dev_null = false;
     let mut rename_from = None;
     let mut rename_to = None;
     let mut seen_diff_git = false;
+    let mut metadata = FileMetadata::default();
 
     while let Some((line, end)) = parser.peek() {
         if line.starts_with("--- ") | line.starts_with("+++ ") | line.starts_with("@@ ") {
@@ -353,6 +459,8 @@ fn header_preamble<'a, T: Text + ToOwned + ?Sized>(
                     let has_prefix = strip_ab_prefix;
                     git_original = parse_git_filename(file1, has_prefix).map(|f| (f, *end));
                     git_modified = parse_git_filename(file2, has_prefix).map(|f| (f, *end));
+                    original_is_dev_null = git_original.is_none();
+                    modified_is_dev_null = git_modified.is_none();
                 } else if let Some((file1, file2)) = rest.split_at_exclusive(" ") {
                     // Either --no-prefix format, or one side is /dev/null which
                     // prevents the " b/" split from matching. When /dev/null is
@@ -362,6 +470,8 @@ fn header_preamble<'a, T: Text + ToOwned + ?Sized>(
                     let has_prefix = has_dev_null && strip_ab_prefix;
                     git_original = parse_git_filename(file1, has_prefix).map(|f| (f, *end));
                     git_modified = parse_git_filename(file2, has_prefix).map(|f| (f, *end));
+                    original_is_dev_null = has_dev_null && git_original.is_none();
+                    modified_is_dev_null = has_dev_null && git_modified.is_none();
                 }
                 // If neither split works, skip this line (malformed diff --git line)
             }
@@ -370,11 +480,27 @@ fn header_preamble<'a, T: Text + ToOwned + ?Sized>(
         else if line.starts_with("rename from ")
             && let Some(filename) = line.strip_prefix("rename from ")
         {
+            metadata.kind = FileChangeKind::Rename;
             rename_from = Some((Cow::Borrowed(filename.as_bytes()), *end));
         } else if line.starts_with("rename to ")
             && let Some(filename) = line.strip_prefix("rename to ")
         {
+            metadata.kind = FileChangeKind::Rename;
             rename_to = Some((Cow::Borrowed(filename.as_bytes()), *end));
+        }
+        // Git extended headers carrying file modes and change kinds.
+        // Note: "new file mode"/"deleted file mode" must be tested before the
+        // shorter "new mode" prefix.
+        else if let Some(mode) = line.strip_prefix("new file mode ") {
+            metadata.kind = FileChangeKind::Create;
+            metadata.new_mode = parse_mode(mode);
+        } else if let Some(mode) = line.strip_prefix("deleted file mode ") {
+            metadata.kind = FileChangeKind::Delete;
+            metadata.old_mode = parse_mode(mode);
+        } else if let Some(mode) = line.strip_prefix("old mode ") {
+            metadata.old_mode = parse_mode(mode);
+        } else if let Some(mode) = line.strip_prefix("new mode ") {
+            metadata.new_mode = parse_mode(mode);
         }
 
         parser.next()?;
@@ -384,18 +510,23 @@ fn header_preamble<'a, T: Text + ToOwned + ?Sized>(
     let original = rename_from.or(git_original);
     let modified = rename_to.or(git_modified);
 
-    Ok((original, modified))
+    Ok(ParsedHeader {
+        original,
+        modified,
+        original_is_dev_null,
+        modified_is_dev_null,
+        metadata,
+    })
 }
 
-#[allow(clippy::type_complexity)]
 fn parse_filename<'a, T: Text + ToOwned + ?Sized>(
     prefix: &str,
     l: (&'a T, Option<LineEnd>),
     strip_ab_prefix: bool,
-) -> Result<Option<(Cow<'a, [u8]>, Option<LineEnd>)>> {
+) -> KindResult<HeaderFilename<'a>> {
     let line =
         l.0.strip_prefix(prefix)
-            .ok_or(ParsePatchError::UnableToParseFilename)?;
+            .ok_or(ParsePatchErrorKind::UnableToParseFilename)?;
 
     let filename = if let Some((filename, _)) = line.split_at_exclusive("\t") {
         filename
@@ -440,18 +571,18 @@ fn is_quoted<T: Text + ?Sized>(s: &T) -> Option<&T> {
     s.strip_prefix("\"").and_then(|s| s.strip_suffix("\""))
 }
 
-fn unescaped_filename<T: Text + ToOwned + ?Sized>(filename: &T) -> Result<Cow<'_, [u8]>> {
+fn unescaped_filename<T: Text + ToOwned + ?Sized>(filename: &T) -> KindResult<Cow<'_, [u8]>> {
     // NOTE: may be a problem for other types of line feed except "\n" and "\r\n".
     let bytes = filename.as_bytes().trim_ascii_end();
 
     if bytes.iter().any(|b| ESCAPED_CHARS_BYTES.contains(b)) {
-        return Err(ParsePatchError::InvalidCharInUnquotedFilename);
+        return Err(ParsePatchErrorKind::InvalidCharInUnquotedFilename);
     }
 
     Ok(bytes.into())
 }
 
-fn escaped_filename<T: Text + ToOwned + ?Sized>(escaped: &T) -> Result<Cow<'_, [u8]>> {
+fn escaped_filename<T: Text + ToOwned + ?Sized>(escaped: &T) -> KindResult<Cow<'_, [u8]>> {
     let mut filename = Vec::new();
 
     let mut chars = escaped.as_bytes().iter().copied();
@@ -459,7 +590,7 @@ fn escaped_filename<T: Text + ToOwned + ?Sized>(escaped: &T) -> Result<Cow<'_, [
         if c == b'\\' {
             let ch = match chars
                 .next()
-                .ok_or(ParsePatchError::ExpectedEscapedCharacter)?
+                .ok_or(ParsePatchErrorKind::ExpectedEscapedCharacter)?
             {
                 b'n' => b'\n',
                 b't' => b'\t',
@@ -467,11 +598,11 @@ fn escaped_filename<T: Text + ToOwned + ?Sized>(escaped: &T) -> Result<Cow<'_, [
                 b'r' => b'\r',
                 b'\"' => b'\"',
                 b'\\' => b'\\',
-                _ => return Err(ParsePatchError::InvalidEscapedCharacter),
+                _ => return Err(ParsePatchErrorKind::InvalidEscapedCharacter),
             };
             filename.push(ch);
         } else if ESCAPED_CHARS_BYTES.contains(&c) {
-            return Err(ParsePatchError::InvalidUnescapedCharacter);
+            return Err(ParsePatchErrorKind::InvalidUnescapedCharacter);
         } else {
             filename.push(c);
         }
@@ -530,12 +661,12 @@ fn hunks<'a, T: Text + ?Sized + ToOwned>(parser: &mut Parser<'a, T>) -> Result<V
     }
 
     if hunks.is_empty() {
-        return Err(ParsePatchError::NoHunks);
+        return Err(parser.err(ParsePatchErrorKind::NoHunks));
     }
 
     // check and verify that the Hunks are in sorted order and don't overlap
     if !parser.config.skip_order_check && !verify_hunks_in_order(&hunks) {
-        return Err(ParsePatchError::HunksOrder);
+        return Err(parser.err(ParsePatchErrorKind::HunksOrder));
     }
 
     Ok(hunks)
@@ -559,8 +690,11 @@ fn tolerance_level<T: Text + ?Sized + ToOwned>(lines: &[Line<'_, T>]) -> (usize,
 }
 
 fn hunk<'a, T: Text + ?Sized + ToOwned>(parser: &mut Parser<'a, T>) -> Result<Hunk<'a, T>> {
-    let n = *parser.peek().ok_or(ParsePatchError::UnexpectedEof)?;
-    let (mut range1, mut range2, function_context) = hunk_header(n)?;
+    let header_line_no = parser.line;
+    let eof = parser.err(ParsePatchErrorKind::UnexpectedEof);
+    let n = *parser.peek().ok_or(eof)?;
+    let (mut range1, mut range2, function_context) =
+        hunk_header(n).map_err(|kind| parser.err_at(header_line_no, kind))?;
     let _ = parser.next();
     let mut lines = hunk_lines(parser, &range1, &range2)?;
 
@@ -573,7 +707,9 @@ fn hunk<'a, T: Text + ?Sized + ToOwned>(parser: &mut Parser<'a, T>) -> Result<Hu
             let tolerance = t.0 + usize::from(t.1);
 
             if len1.abs_diff(range1.len) > tolerance || len2.abs_diff(range2.len) > tolerance {
-                return Err(ParsePatchError::HunkHeaderHunkMismatch);
+                return Err(
+                    parser.err_at(header_line_no, ParsePatchErrorKind::HunkHeaderHunkMismatch)
+                );
             }
         }
         HunkRangeStrategy::Recount => {
@@ -605,41 +741,41 @@ fn hunk<'a, T: Text + ?Sized + ToOwned>(parser: &mut Parser<'a, T>) -> Result<Hu
 
 type HunkHeader<'a, T> = (HunkRange, HunkRange, Option<(&'a T, Option<LineEnd>)>);
 
-fn hunk_header<T: Text + ?Sized>(oinput: (&T, Option<LineEnd>)) -> Result<HunkHeader<'_, T>> {
+fn hunk_header<T: Text + ?Sized>(oinput: (&T, Option<LineEnd>)) -> KindResult<HunkHeader<'_, T>> {
     let input = oinput
         .0
         .strip_prefix("@@ ")
-        .ok_or(ParsePatchError::HunkHeader)?;
+        .ok_or(ParsePatchErrorKind::HunkHeader)?;
 
     let (ranges, function_context) = input
         .split_at_exclusive(" @@")
-        .ok_or(ParsePatchError::HunkHeaderUnterminated)?;
+        .ok_or(ParsePatchErrorKind::HunkHeaderUnterminated)?;
     let function_context = function_context.strip_prefix(" ");
 
     let (range1, range2) = ranges
         .split_at_exclusive(" ")
-        .ok_or(ParsePatchError::HunkHeader)?;
+        .ok_or(ParsePatchErrorKind::HunkHeader)?;
     let range1 = range(
         range1
             .strip_prefix("-")
-            .ok_or(ParsePatchError::HunkHeader)?,
+            .ok_or(ParsePatchErrorKind::HunkHeader)?,
     )?;
     let range2 = range(
         range2
             .strip_prefix("+")
-            .ok_or(ParsePatchError::HunkHeader)?,
+            .ok_or(ParsePatchErrorKind::HunkHeader)?,
     )?;
     Ok((range1, range2, function_context.map(|fc| (fc, oinput.1))))
 }
 
-fn range<T: Text + ?Sized>(s: &T) -> Result<HunkRange> {
+fn range<T: Text + ?Sized>(s: &T) -> KindResult<HunkRange> {
     let (start, len) = if let Some((start, len)) = s.split_at_exclusive(",") {
         (
-            start.parse().ok_or(ParsePatchError::Range)?,
-            len.parse().ok_or(ParsePatchError::Range)?,
+            start.parse().ok_or(ParsePatchErrorKind::Range)?,
+            len.parse().ok_or(ParsePatchErrorKind::Range)?,
         )
     } else {
-        (s.parse().ok_or(ParsePatchError::Range)?, 1)
+        (s.parse().ok_or(ParsePatchErrorKind::Range)?, 1)
     };
 
     Ok(HunkRange::new(start, len))
@@ -675,7 +811,7 @@ fn hunk_lines<'a, T: Text + ?Sized + ToOwned>(
         }
 
         let line = if no_newline_context {
-            return Err(ParsePatchError::ExpectedEndOfHunk);
+            return Err(parser.err(ParsePatchErrorKind::ExpectedEndOfHunk));
         } else if let Some(l) = line.0.strip_prefix(" ") {
             old_lines_seen += 1;
             new_lines_seen += 1;
@@ -686,20 +822,20 @@ fn hunk_lines<'a, T: Text + ?Sized + ToOwned>(
             Line::Context(*line)
         } else if let Some(l) = line.0.strip_prefix("-") {
             if no_newline_delete {
-                return Err(ParsePatchError::UnexpectedDeletedLine);
+                return Err(parser.err(ParsePatchErrorKind::UnexpectedDeletedLine));
             }
             old_lines_seen += 1;
             Line::Delete((l, line.1))
         } else if let Some(l) = line.0.strip_prefix("+") {
             if no_newline_insert {
-                return Err(ParsePatchError::UnexpectedInsertLine);
+                return Err(parser.err(ParsePatchErrorKind::UnexpectedInsertLine));
             }
             new_lines_seen += 1;
             Line::Insert((l, line.1))
         } else if line.0.starts_with(NO_NEWLINE_AT_EOF) {
             let last_line = lines
                 .pop()
-                .ok_or(ParsePatchError::UnexpectedNoNewlineAtEOF)?;
+                .ok_or_else(|| parser.err(ParsePatchErrorKind::UnexpectedNoNewlineAtEOF))?;
             match last_line {
                 Line::Context((line, _end)) => {
                     no_newline_context = true;
@@ -715,7 +851,7 @@ fn hunk_lines<'a, T: Text + ?Sized + ToOwned>(
                 }
             }
         } else {
-            return Err(ParsePatchError::UnexpectedLineInHunkBody);
+            return Err(parser.err(ParsePatchErrorKind::UnexpectedLineInHunkBody));
         };
 
         lines.push(line);
@@ -729,7 +865,7 @@ fn hunk_lines<'a, T: Text + ?Sized + ToOwned>(
 mod tests {
     use crate::patch::Line;
     use crate::patch::parse::{
-        HunkRangeStrategy, ParsePatchError, ParserConfig, parse_multiple_with_config,
+        HunkRangeStrategy, ParsePatchErrorKind, ParserConfig, parse_multiple_with_config,
     };
 
     use super::{parse, parse_bytes, parse_multiple};
@@ -893,7 +1029,7 @@ mod tests {
         // Strict mode (default) should reject this patch
         let result = parse_multiple(&input);
         assert!(
-            matches!(result, Err(ParsePatchError::HunksOrder)),
+            matches!(&result, Err(err) if *err.kind() == ParsePatchErrorKind::HunksOrder),
             "Expected HunksOrder error in strict mode, got {:?}",
             result
         );
@@ -1368,14 +1504,133 @@ deleted file mode 100644
 -f
 +g
 ";
-        assert!(matches!(
-            parse(s),
-            Err(ParsePatchError::HunkHeaderHunkMismatch)
-        ));
+        let err = parse(s).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            &ParsePatchErrorKind::HunkHeaderHunkMismatch,
+            "{err}"
+        );
+        // The error points at the offending hunk's header line
+        assert_eq!(err.line(), 7);
 
         // str and bytes front ends agree on multi-file inputs, too.
         assert!(parse_multiple(s).is_err());
         assert!(super::parse_bytes_multiple(s.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn test_error_line_numbers() {
+        // The error carries the 1-based line number of the offending line
+        let s = "\
+--- a/f
++++ b/f
+@@ -1,2 +1,2 @@
+ a
+-b
++c
+@@ broken header
+";
+        let err = parse(s).unwrap_err();
+        assert_eq!(err.kind(), &ParsePatchErrorKind::HunkHeaderUnterminated);
+        assert_eq!(err.line(), 7);
+
+        // Bad filename header
+        let err = parse("--- \"unterminated\n+++ b\n@@ -1 +1 @@\n-x\n+y\n").unwrap_err();
+        assert_eq!(err.line(), 1);
+
+        // Display includes the position
+        assert!(err.to_string().contains("(line 1)"), "{err}");
+    }
+
+    #[test]
+    fn test_metadata_create_delete_rename_modes() {
+        use crate::patch::{FileChangeKind, FileMetadata};
+
+        // Creation via git header
+        let patch = "\
+diff --git a/new.txt b/new.txt
+new file mode 100755
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,1 @@
++hello
+";
+        let diff = parse(patch).unwrap();
+        assert_eq!(diff.metadata().kind, FileChangeKind::Create);
+        assert_eq!(diff.metadata().new_mode, Some(0o100755));
+
+        // Deletion via git header
+        let patch = "\
+diff --git a/old.txt b/old.txt
+deleted file mode 100644
+--- a/old.txt
++++ /dev/null
+@@ -1,1 +0,0 @@
+-bye
+";
+        let diff = parse(patch).unwrap();
+        assert_eq!(diff.metadata().kind, FileChangeKind::Delete);
+        assert_eq!(diff.metadata().old_mode, Some(0o100644));
+
+        // Pure rename
+        let patch = "\
+diff --git a/before.txt b/after.txt
+similarity index 100%
+rename from before.txt
+rename to after.txt
+";
+        let diffs = parse_multiple(patch).unwrap();
+        assert_eq!(diffs[0].metadata().kind, FileChangeKind::Rename);
+
+        // Mode-only change
+        let patch = "\
+diff --git a/script.sh b/script.sh
+old mode 100644
+new mode 100755
+";
+        let diffs = parse_multiple(patch).unwrap();
+        assert_eq!(diffs[0].metadata().kind, FileChangeKind::Modify);
+        assert_eq!(diffs[0].metadata().old_mode, Some(0o100644));
+        assert_eq!(diffs[0].metadata().new_mode, Some(0o100755));
+
+        // Plain-format creation via /dev/null
+        let patch = "\
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,1 @@
++hello
+";
+        let diff = parse(patch).unwrap();
+        assert_eq!(diff.metadata().kind, FileChangeKind::Create);
+
+        // A merely MISSING header is not a creation signal
+        let patch = "\
++++ modified
+@@ -0,0 +1,1 @@
++hello
+";
+        let diff = parse(patch).unwrap();
+        assert_eq!(diff.metadata().kind, FileChangeKind::Modify);
+
+        // Plain modification stays default
+        let patch = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n+y\n";
+        let diff = parse(patch).unwrap();
+        assert_eq!(diff.metadata(), &FileMetadata::default());
+
+        // reverse() flips create/delete and swaps modes
+        let patch = "\
+diff --git a/new.txt b/new.txt
+new file mode 100755
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,1 @@
++hello
+";
+        let diff = parse(patch).unwrap();
+        let reversed = diff.reverse();
+        assert_eq!(reversed.metadata().kind, FileChangeKind::Delete);
+        assert_eq!(reversed.metadata().old_mode, Some(0o100755));
+        assert_eq!(reversed.metadata().new_mode, None);
     }
 
     #[test]

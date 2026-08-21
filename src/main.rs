@@ -9,14 +9,15 @@
 use std::{
     fs, io,
     io::{Read, Write},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::ExitCode,
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
 use flickzeug::{
-    ApplyConfig, ApplyOutcome, ConflictStyle, DiffOptions, FuzzyConfig, HunkRangeStrategy,
-    MergeOptions, ParserConfig, PatchFormatter, apply_bytes_reporting,
+    ApplyConfig, ConflictStyle, DiffOptions, FuzzyConfig, HunkRangeStrategy, MergeOptions,
+    ParserConfig, PatchFormatter,
+    fs::{DirApplyOptions, FileOutcome, apply_patch_dir},
     patch_from_bytes_with_config,
 };
 
@@ -193,30 +194,6 @@ fn run_diff(
     Ok(ExitCode::from(1))
 }
 
-/// Strip `n` leading components and reject paths that could escape `directory`.
-fn resolve_target(directory: &Path, name: &[u8], strip: usize) -> Result<PathBuf, Error> {
-    let name =
-        String::from_utf8(name.to_vec()).map_err(|_| "patch contains a non-utf8 file name")?;
-    let path: PathBuf = Path::new(&name).components().skip(strip).collect();
-
-    if path.as_os_str().is_empty() {
-        return Err(format!("nothing left of file name {name:?} after -p{strip}").into());
-    }
-    for component in path.components() {
-        match component {
-            Component::Normal(_) | Component::CurDir => {}
-            _ => return Err(format!("refusing to touch unsafe path {name:?}").into()),
-        }
-    }
-
-    // Avoid a cosmetic "./" prefix in messages when patching the current dir
-    if directory == Path::new(".") {
-        Ok(path)
-    } else {
-        Ok(directory.join(path))
-    }
-}
-
 fn run_apply(
     patch: Option<&Path>,
     directory: &Path,
@@ -244,126 +221,66 @@ fn run_apply(
         skip_order_check: lenient,
         strip_ab_prefix: true,
     };
-    let diffs = patch_from_bytes_with_config(&patch_data, parser_config)
+    let patch = patch_from_bytes_with_config(&patch_data, parser_config)
         .map_err(|err| format!("failed to parse patch: {err}"))?;
-    if diffs.is_empty() {
+    if patch.is_empty() {
         return Err("patch contains no file diffs".into());
     }
+    let total_hunks: Vec<usize> = patch.iter().map(|diff| diff.hunks().len()).collect();
 
-    let apply_config = ApplyConfig {
-        fuzzy_config: FuzzyConfig {
-            max_fuzz: fuzz,
-            ..FuzzyConfig::default()
+    let options = DirApplyOptions {
+        apply_config: ApplyConfig {
+            fuzzy_config: FuzzyConfig {
+                max_fuzz: fuzz,
+                ..FuzzyConfig::default()
+            },
+            ..ApplyConfig::default()
         },
-        ..ApplyConfig::default()
+        strip,
+        reverse,
+        dry_run,
+        write_rejects: true,
     };
 
+    let report = apply_patch_dir(directory, &patch, &options)?;
+
     let mut failures = 0usize;
-    for diff in &diffs {
-        let reversed;
-        let diff = if reverse {
-            reversed = diff.reverse();
-            &reversed
-        } else {
-            diff
-        };
-
-        let original = diff
-            .original()
-            .map(|name| resolve_target(directory, name, strip))
-            .transpose()?;
-        let modified = diff
-            .modified()
-            .map(|name| resolve_target(directory, name, strip))
-            .transpose()?;
-
-        match (original, modified) {
-            (None, None) => {}
-            // Pure rename or metadata-only diff without hunks
-            (Some(from), Some(to)) if diff.hunks().is_empty() => {
-                if from == to {
-                    println!("{}: no content changes, skipped", from.display());
-                } else {
-                    println!("renaming {} to {}", from.display(), to.display());
-                    if !dry_run {
-                        rename_file(&from, &to)?;
-                    }
+    for (file, total) in report.iter().zip(total_hunks) {
+        let path = file.path.display();
+        match &file.outcome {
+            FileOutcome::Patched { .. } => println!("patching file {path}"),
+            FileOutcome::Deleted => println!("removing file {path}"),
+            FileOutcome::Renamed { to } => println!("renaming {path} to {}", to.display()),
+            FileOutcome::AlreadyApplied => println!("{path}: already applied, skipped"),
+            FileOutcome::Unchanged => println!("{path}: no content changes, skipped"),
+            FileOutcome::HunksRejected {
+                rejected,
+                reject_file,
+                ..
+            } => {
+                println!("patching file {path}");
+                match reject_file {
+                    Some(reject) => eprintln!(
+                        "{rejected} out of {total} hunk{} FAILED -- saving rejects to file {}",
+                        if total == 1 { "" } else { "s" },
+                        reject.display()
+                    ),
+                    None => eprintln!(
+                        "{rejected} out of {total} hunk{} FAILED",
+                        if total == 1 { "" } else { "s" },
+                    ),
                 }
-            }
-            // File deletion: apply the hunks and remove the file if empty
-            (Some(from), None) => {
-                let base = read_file(&from)?;
-                match apply_bytes_reporting(&base, diff, &apply_config) {
-                    ApplyOutcome::Applied(content, _) if content.is_empty() => {
-                        println!("removing file {}", from.display());
-                        if !dry_run {
-                            fs::remove_file(&from)?;
-                        }
-                    }
-                    ApplyOutcome::Applied(content, _) => {
-                        println!("patching file {} (not removed: not empty)", from.display());
-                        if !dry_run {
-                            fs::write(&from, content)?;
-                        }
-                    }
-                    ApplyOutcome::AlreadyApplied(_) => {
-                        println!("{}: already applied, skipped", from.display());
-                    }
-                    ApplyOutcome::Failed(err) => {
-                        eprintln!("{}: {err}", from.display());
-                        failures += 1;
-                    }
-                }
-            }
-            // File creation or modification (possibly a rename)
-            (original, Some(to)) => {
-                let base = match &original {
-                    Some(from) if from.exists() => read_file(from)?,
-                    Some(_) | None if to.exists() => read_file(&to)?,
-                    _ => Vec::new(),
-                };
-                match apply_bytes_reporting(&base, diff, &apply_config) {
-                    ApplyOutcome::Applied(content, _) => {
-                        println!("patching file {}", to.display());
-                        if !dry_run {
-                            if let Some(parent) = to.parent() {
-                                fs::create_dir_all(parent)?;
-                            }
-                            fs::write(&to, content)?;
-                            if let Some(from) = &original
-                                && *from != to
-                                && from.exists()
-                            {
-                                fs::remove_file(from)?;
-                            }
-                        }
-                    }
-                    ApplyOutcome::AlreadyApplied(_) => {
-                        println!("{}: already applied, skipped", to.display());
-                    }
-                    ApplyOutcome::Failed(err) => {
-                        eprintln!("{}: {err}", to.display());
-                        failures += 1;
-                    }
-                }
+                failures += 1;
             }
         }
     }
 
     if failures > 0 {
-        eprintln!("{failures} out of {} file(s) failed to patch", diffs.len());
+        eprintln!("{failures} out of {} file(s) failed to patch", patch.len());
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)
     }
-}
-
-fn rename_file(from: &Path, to: &Path) -> Result<(), Error> {
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::rename(from, to)?;
-    Ok(())
 }
 
 fn run_merge(
